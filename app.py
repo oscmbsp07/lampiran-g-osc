@@ -46,7 +46,7 @@ ALLOWED_SHEETS = {
 # Urutan daerah untuk sort
 DAERAH_ORDER = {"SPU": 0, "SPS": 1, "SPT": 2}
 
-# Kod rujukan
+# Kod rujukan (untuk serentak / ringkasan jenis)
 KNOWN_CODES = [
     "PKM", "TKR-GUNA", "TKR", "124A", "204D", "PS", "SB", "CT",
     "KTUP", "LJUP", "JP", "PL",
@@ -62,6 +62,12 @@ JL_CODES = {"PL"}
 # UI HELPERS (BACKGROUND + CSS)
 # ============================================================
 def _inject_bg_and_css(img_path: str) -> bool:
+    """
+    Background fixed layer + CSS stabilizer:
+    - elak 'zoom' bila rerun (upload/click)
+    - scrollbar sentiasa wujud tapi disorok (tak jadi width berubah)
+    - panel container border=True jadi kemas tanpa div kosong
+    """
     try:
         with open(img_path, "rb") as f:
             data = f.read()
@@ -98,7 +104,9 @@ def _inject_bg_and_css(img_path: str) -> bool:
 
     css = f"""
     <style>
-      html, body {{ height: 100%; }}
+      html, body {{
+        height: 100%;
+      }}
 
       body {{
         overflow-y: scroll;
@@ -252,15 +260,13 @@ def nama_norm(x: str) -> str:
 
 
 def keputusan_is_empty(v) -> bool:
-    """Keputusan kosong sahaja yang layak masuk."""
+    """Kosong / '-' / placeholder sahaja dianggap TIADA keputusan."""
     if v is None or is_nan(v):
         return True
     s = str(v).strip()
     if s == "" or s == "-" or s.lower() in {"tiada", "nil", "n/a", "na"}:
         return True
-    if parse_date_from_cell(s) is not None:
-        return False
-    # apa-apa isi pun dikira ada keputusan
+    # Kalau ada apa-apa isi (termasuk tarikh/teks) -> anggap ADA keputusan
     return False
 
 
@@ -322,6 +328,11 @@ def perkara_3lines(d: Optional[dt.date]) -> str:
 
 
 def tindakan_ut(belum_text: str) -> str:
+    """
+    Kategori 2 (UT):
+    - kalau dalaman: map ke nama 'Pengarah ...'
+    - kalau luaran: kekalkan shortform (uppercase)
+    """
     raw = (belum_text or "").strip()
     parts = [p.strip() for p in re.split(r"[,&/]+", raw) if p.strip()]
 
@@ -377,15 +388,16 @@ def parse_agenda_docx(file_bytes: bytes) -> Tuple[Set[str], Set[str]]:
 
     full = "\n".join(texts)
 
+    # Cari No. Rujukan OSC (MBSP...)
     osc_set: Set[str] = set()
-    # tangkap MBSP.... (lebih longgar, tapi selamat)
-    for m in re.finditer(r"(MBSP[^\s]{5,80})", full, flags=re.IGNORECASE):
+    for m in re.finditer(r"(MBSP[^\s]{5,60})", full, flags=re.IGNORECASE):
         cand = m.group(1).splitlines()[0].strip(" ,.;")
         if "MBSP" in cand.upper():
             osc_set.add(osc_norm(cand))
 
+    # Cari Tetuan: ...
     nama_set: Set[str] = set()
-    for m in re.finditer(r"\bTetuan\b\s*[:\-]?\s*([A-Za-z0-9&.,()/\-\s]{3,120})", full, flags=re.IGNORECASE):
+    for m in re.finditer(r"\bTetuan\b\s*[:\-]?\s*([A-Za-z0-9&.,()/\-\s]{3,140})", full, flags=re.IGNORECASE):
         nm = m.group(1).splitlines()[0].strip()
         nm = re.split(r"\s{2,}", nm)[0].strip()
         if nm:
@@ -395,59 +407,55 @@ def parse_agenda_docx(file_bytes: bytes) -> Tuple[Set[str], Set[str]]:
 
 
 # ============================================================
-# EXCEL READER (auto-detect header row)
+# EXCEL READER (auto-detect header row + stronger column detect)
 # ============================================================
 HEADER_HINTS = [
     "No. Rujukan OSC",
-    "No Rujukan OSC",
     "No. Rujukan",
     "Rujukan OSC",
     "Pemaju",
     "Pemohon",
-    "Pemaju/Pemohon",
     "Daerah",
     "Mukim",
     "Lot",
     "Tempoh Untuk Proses",
     "Tempoh Untuk Diberi",
     "Tarikh Keputusan",
-    "Tarikh Keputusan Kuasa Melulus",
-    "Jabatan Induk / Teknikal yang Belum Memberi Keputusan",
+    "Belum Memberi",
 ]
 
+# lebih banyak varian untuk elak miss
 COL_CANDIDATES = {
     "fail_no": [
-        "norujukanosc", "norujukan", "rujukanosc", "rujukan", "failno", "fail no",
-        "no rujukan osc", "no rujukan",
+        "norujukanosc", "no rujukan osc", "rujukan osc",
+        "no rujukan", "no.rujukan", "fail no", "failno",
     ],
     "pemohon": [
-        "pemajupemohon", "pemaju/pemohon", "pemaju", "pemohon", "tetuan",
+        "pemajupemohon", "pemaju/pemohon", "pemaju", "pemohon", "tetuan"
     ],
-    "mukim": [
-        "mukimseksyen", "mukim/seksyen", "mukim", "seksyen",
-    ],
+    "daerah": ["daerah"],
+    "mukim": ["mukimseksyen", "mukim/seksyen", "mukim", "seksyen"],
     "lot": ["lot"],
+
+    # KM/UT column name memang selalu panjang & ada linebreak
     "km": [
         "tempohuntukprosesolehjabataninduk",
-        "tempohuntukproses",
+        "tempohuntukproses", "tarikhtamattempohproses",
     ],
     "ut": [
         "tempohuntukdiberiulasanolehjabatanteknikal",
-        "tempohuntukdiberiulasan",
-        "tempohulasan",
+        "tempohuntukdiberiulasan", "tarikhtamattempohulasan",
+        "tempohuntukdiberiulasanolehjabatan/teknikal",
     ],
     "belum": [
-        "jabatanindukteknikalbelummemberikeputusanulasansehinggakini",
-        "jabatanindukteknikalyangbelummemberikeputusanulasansehinggakini",
-        "belummemberikeputusanulasan",
-        "ygbelummemberikeputusan",
-        "belummemberi",
+        "jabatanindukteknikalygbelummemberikeputusanulasansehinggakini",
+        "jabatanindukteknikalygbelummemberikeputusanulasan",
+        "belummemberikeputusanulasan", "ygbelummemberikeputusan",
+        "belummemberi", "jabatanindukteknikalbelum", "belum",
     ],
     "keputusan": [
-        "tarikhkeputusankuasa",
-        "tarikhkeputusan",
-        "tarikhkeputusankuasa melulus",
-        "tarikhkeputusankuasamelulus",
+        "tarikhkeputusankuasa", "tarikhkeputusankuasamelulus",
+        "tarikhkeputusan", "keputusan", "statuskeputusan",
     ],
 }
 
@@ -455,55 +463,82 @@ COL_CANDIDATES = {
 def norm_basic(s: str) -> str:
     s = "" if s is None else str(s)
     s = s.strip().lower()
-    s = re.sub(r"[\s\r\n\t]+", " ", s)
+    s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    s = s.replace("*", "")
+    s = re.sub(r"[\s]+", " ", s)
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
 
 
 def find_header_row(excel_bytes: bytes, sheet: str) -> Tuple[Optional[int], int]:
-    raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=None, engine="openpyxl", nrows=80)
+    raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=None, engine="openpyxl", nrows=60)
     best_idx, best_score = None, 0
-
-    # pre-normalize hints
-    hint_norm = [norm_basic(h) for h in HEADER_HINTS]
-
     for i in range(len(raw)):
         row = raw.iloc[i].astype(str).fillna("")
         joined = " | ".join(row.tolist())
-        jn = norm_basic(joined)
-
         score = 0
-        for h in hint_norm:
-            if h and h in jn:
+        for h in HEADER_HINTS:
+            if h.lower() in joined.lower():
                 score += 1
-
         if score > best_score:
             best_score, best_idx = score, i
-
     return best_idx, best_score
 
 
 def detect_columns(df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Stronger detection:
+    - normalize header -> alnum only
+    - allow 'contains' matching
+    - fallback: if cannot find belum/ut/keputusan, try broader keyword search
+    """
     norm_map = {col: norm_basic(col) for col in df.columns}
     found: Dict[str, str] = {}
 
-    for key, needles in COL_CANDIDATES.items():
+    def _find_by_needles(key: str, needles: List[str]) -> Optional[str]:
         for needle in needles:
             nneedle = norm_basic(needle)
             for col, ncol in norm_map.items():
                 if nneedle and nneedle in ncol:
-                    found[key] = col
-                    break
-            if key in found:
+                    return col
+        return None
+
+    # pass 1 (strict by candidates)
+    for key, needles in COL_CANDIDATES.items():
+        hit = _find_by_needles(key, needles)
+        if hit:
+            found[key] = hit
+
+    # pass 2 (fallback heuristic)
+    # BELUM: cari header yang ada "belum" dan ("ulasan" / "keputusan" / "jabatan")
+    if "belum" not in found:
+        for col, ncol in norm_map.items():
+            if "belum" in ncol and ("ulasan" in ncol or "keputusan" in ncol or "jabatan" in ncol):
+                found["belum"] = col
+                break
+
+    # UT: cari header ada "tempoh" + "ulasan"
+    if "ut" not in found:
+        for col, ncol in norm_map.items():
+            if "tempoh" in ncol and "ulasan" in ncol:
+                found["ut"] = col
+                break
+
+    # KEPUTUSAN: cari header ada "keputusan" atau "kuasa"
+    if "keputusan" not in found:
+        for col, ncol in norm_map.items():
+            if "keputusan" in ncol or "kuasa" in ncol:
+                found["keputusan"] = col
                 break
 
     return found
 
 
-def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> Tuple[List[dict], List[dict]]:
+def read_kertas_excel(excel_bytes: bytes, daerah_label: str, debug: bool = False) -> Tuple[List[dict], List[dict]]:
     """
-    Return (rows, debug_info)
-    debug_info: list dict per sheet (read/skip reason)
+    Returns:
+      rows: list of normalized records
+      dbg:  list of per-sheet debug records (column detection etc.)
     """
     out: List[dict] = []
     dbg: List[dict] = []
@@ -518,23 +553,38 @@ def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> Tuple[List[dict]
 
         hdr_idx, score = find_header_row(excel_bytes, sheet)
         if hdr_idx is None or score == 0:
-            dbg.append({"daerah": daerah_label, "sheet": sheet_clean, "status": "SKIP", "reason": "Header tak jumpa"})
+            if debug:
+                dbg.append({"daerah": daerah_label, "sheet": sheet_clean, "status": "skip", "reason": "header row tak jumpa"})
             continue
 
         df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=hdr_idx, engine="openpyxl")
         df = df.dropna(how="all")
         if df.empty:
-            dbg.append({"daerah": daerah_label, "sheet": sheet_clean, "status": "SKIP", "reason": "Sheet kosong"})
+            if debug:
+                dbg.append({"daerah": daerah_label, "sheet": sheet_clean, "status": "skip", "reason": "sheet kosong"})
             continue
 
         cols = detect_columns(df)
-        # wajib fail_no + pemohon
+
+        if debug:
+            dbg.append({
+                "daerah": daerah_label,
+                "sheet": sheet_clean,
+                "status": "ok",
+                "header_row": hdr_idx,
+                "score": score,
+                "col_fail_no": cols.get("fail_no"),
+                "col_pemohon": cols.get("pemohon"),
+                "col_km": cols.get("km"),
+                "col_ut": cols.get("ut"),
+                "col_belum": cols.get("belum"),
+                "col_keputusan": cols.get("keputusan"),
+            })
+
+        # minimum required
         if "fail_no" not in cols or "pemohon" not in cols:
-            dbg.append({"daerah": daerah_label, "sheet": sheet_clean, "status": "SKIP",
-                        "reason": f"Kolum wajib tak lengkap (jumpa: {list(cols.keys())})"})
             continue
 
-        n_added = 0
         for _, row in df.iterrows():
             fail = row.get(cols["fail_no"])
             pem = row.get(cols["pemohon"])
@@ -554,9 +604,6 @@ def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> Tuple[List[dict]
                 "keputusan": clean_str(row.get(cols["keputusan"])) if "keputusan" in cols else "",
             }
             out.append(rec)
-            n_added += 1
-
-        dbg.append({"daerah": daerah_label, "sheet": sheet_clean, "status": "OK", "reason": f"Row masuk: {n_added}"})
 
     return out, dbg
 
@@ -588,13 +635,34 @@ def build_categories(
     ut_start: dt.date,
     ut_end: dt.date,
     ut_enabled: bool,
-) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
+) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict]]:
+    """
+    Return cat1..cat5 + debug_rows (optional for UI).
+    """
+    debug_rows: List[dict] = []
 
-    # ===== GLOBAL FILTER 1: keputusan mesti kosong
-    rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
+    # 1) tapis keputusan (global): kalau ADA keputusan -> buang (tak masuk mana-mana kategori)
+    rows2 = []
+    for r in rows:
+        if keputusan_is_empty(r.get("keputusan")):
+            rows2.append(r)
+        else:
+            debug_rows.append({**r, "reason_exclude": "Ada keputusan (exclude global)"})
+    rows = rows2
 
-    # ===== GLOBAL FILTER 2: agenda override (buang semua yang ada dalam agenda)
-    rows = [r for r in rows if (r["osc_norm"] not in agenda_osc_set) and (r["nama_norm"] not in agenda_nama_set)]
+    # 2) tapis agenda: agenda mengatasi semua (exclude kalau match No. OSC ATAU Tetuan)
+    rows2 = []
+    for r in rows:
+        if (r["osc_norm"] in agenda_osc_set) or (r["nama_norm"] in agenda_nama_set):
+            debug_rows.append({**r, "reason_exclude": "Ada dalam Agenda (exclude global)"})
+        else:
+            rows2.append(r)
+    rows = rows2
+
+    # 3) group by fail_induk untuk serentak logic
+    by_induk: Dict[str, List[dict]] = {}
+    for r in rows:
+        by_induk.setdefault(r["fail_induk"], []).append(r)
 
     def make_rec(cat: int, tindakan: str, base_r: dict, jenis: str, fail_no: str, perkara: str, extra_key: str) -> dict:
         return {
@@ -612,51 +680,15 @@ def build_categories(
 
     cat1, cat2, cat3, cat4, cat5 = [], [], [], [], []
 
-    # ============================================================
-    # KATEGORI 2 — UT (SEMUA SHEET)
-    # ============================================================
-    if ut_enabled:
-        for r in rows:
-            if not in_range(r.get("ut_date"), ut_start, ut_end):
-                continue
-            if not (r.get("belum") or "").strip():
-                continue
-
-            tindakan = tindakan_ut(r["belum"])
-            perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {r['ut_date'].strftime('%d.%m.%Y')}."
-
-            if r.get("serentak"):
-                codes_sorted = canon_serentak_codes(set(r.get("codes") or set()))
-                codes_join = "+".join(codes_sorted).strip()
-                label_txt = (r.get("label") or "").strip()
-                if codes_join:
-                    jenis = (f"{codes_join} {label_txt} (Serentak)".strip() if label_txt else f"{codes_join} (Serentak)").strip()
-                else:
-                    jenis = (r["sheet"] + (f" {label_txt}" if label_txt else "") + " (Serentak)").strip()
-                fail_no = r["fail_no_raw"]
-            else:
-                jenis = (r["sheet"] + (f" {r['label']}" if r.get("label") else "")).strip()
-                fail_no = r["fail_no_raw"]
-
-            cat2.append(make_rec(2, tindakan, r, jenis, fail_no, perkara, r["belum"].strip()))
-
-    # ============================================================
-    # Group by fail_induk untuk kategori KM (1,3,4,5)
-    # ============================================================
-    by_induk: Dict[str, List[dict]] = {}
-    for r in rows:
-        by_induk.setdefault(r["fail_induk"], []).append(r)
-
     for induk, grp in by_induk.items():
-        is_ser = any(g.get("serentak") for g in grp)
+        is_ser = any(g["serentak"] for g in grp)
 
         union_codes: Set[str] = set()
         labels: List[str] = []
         km_dates = [g["km_date"] for g in grp if g.get("km_date")]
-
         for g in grp:
-            union_codes |= set(g.get("codes") or set())
-            if g.get("label"):
+            union_codes |= set(g["codes"])
+            if g["label"]:
                 labels.append(g["label"])
 
         label_txt = " ".join(dict.fromkeys([l for l in labels if l])).strip()
@@ -667,9 +699,9 @@ def build_categories(
         jenis_ser = (f"{codes_join} {label_txt} (Serentak)".strip() if label_txt else f"{codes_join} (Serentak)").strip()
         fail_no_ser = f"{induk}-{codes_join}" if codes_join else induk
 
-        # ========================
-        # KATEGORI 1 — KM (PB/BGN)
-        # ========================
+        # ============================
+        # KATEGORI 1 — KM (PB/BGN)  [ikut struktur asal awak]
+        # ============================
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & (PB_CODES - {"PS", "SB", "CT"}):
                 cat1.append(make_rec(1, "Pengarah Perancang Bandar", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-PB"))
@@ -681,15 +713,40 @@ def build_categories(
                 if not in_range(g.get("km_date"), km_start, km_end):
                     continue
                 if g["codes"] & {"PKM", "TKR", "TKR-GUNA"}:
-                    jenis = (g["sheet"] + (f" {g['label']}" if g.get("label") else "")).strip()
+                    jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat1.append(make_rec(1, "Pengarah Perancang Bandar", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-PB"))
                 if g["codes"] & BGN_CODES:
-                    jenis = (g["sheet"] + (f" {g['label']}" if g.get("label") else "")).strip()
+                    jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat1.append(make_rec(1, "Pengarah Bangunan", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-BGN"))
 
-        # =================================
-        # KATEGORI 3/4/5 — KM (ikut sheet)
-        # =================================
+        # ============================
+        # KATEGORI 2 — UT (SEMUA SHEET)  ✅ FIX BESAR
+        # Rule:
+        #   - ut_date dalam range UT
+        #   - belum ADA isi
+        #   - keputusan global dah ditapis awal (jadi tak perlu check lagi)
+        # ============================
+        if ut_enabled:
+            for g in grp:
+                ut_d = g.get("ut_date")
+                belum_txt = (g.get("belum") or "").strip()
+
+                if not in_range(ut_d, ut_start, ut_end):
+                    continue
+                if not belum_txt:
+                    # Debug: dalam range UT tapi belum kosong
+                    debug_rows.append({**g, "reason_exclude": "UT dalam range tapi 'Belum' kosong (mungkin column tak detect)"})
+                    continue
+
+                tindakan = tindakan_ut(belum_txt)
+                perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {ut_d.strftime('%d.%m.%Y')}."
+                jenis = (jenis_ser if is_ser else g["sheet"]) + (f" {g['label']}" if g["label"] else "")
+                fail_no = (fail_no_ser if is_ser else g["fail_no_raw"])
+                cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, belum_txt))
+
+        # ============================
+        # KATEGORI 3/4/5 — KM (kekal asal awak)
+        # ============================
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & KEJ_CODES:
                 cat3.append(make_rec(3, "Pengarah Kejuruteraan", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-KEJ"))
@@ -701,15 +758,13 @@ def build_categories(
         if not is_ser:
             for g in grp:
                 if in_range(g.get("km_date"), km_start, km_end) and (g["sheet"].strip().upper() in {"KTUP", "JP", "LJUP"}):
-                    jenis = (g["sheet"] + (f" {g['label']}" if g.get("label") else "")).strip()
+                    jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat3.append(make_rec(3, "Pengarah Kejuruteraan", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), f"NS-{g['sheet']}"))
-
                 if in_range(g.get("km_date"), km_start, km_end) and (g["sheet"].strip().upper() == "PL"):
-                    jenis = (g["sheet"] + (f" {g['label']}" if g.get("label") else "")).strip()
+                    jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat4.append(make_rec(4, "Pengarah Landskap", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-PL"))
-
                 if in_range(g.get("km_date"), km_start, km_end) and (g["sheet"].strip().upper() in {"PS", "SB", "CT"}):
-                    jenis = (g["sheet"] + (f" {g['label']}" if g.get("label") else "")).strip()
+                    jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat5.append(make_rec(5, "Pengarah Perancang Bandar", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), f"NS-{g['sheet']}"))
 
     def dedup_list(lst: List[dict]) -> List[dict]:
@@ -733,7 +788,7 @@ def build_categories(
         for i, r in enumerate(lst, start=1):
             r["bil"] = i
 
-    return cat1, cat2, cat3, cat4, cat5
+    return cat1, cat2, cat3, cat4, cat5, debug_rows
 
 
 # ============================================================
@@ -1039,8 +1094,10 @@ def build_word_doc(
         fill_table(tbl, recs)
 
     add_category_section(1, cat1)
+
     if ut_enabled:
         add_category_section(2, cat2)
+
     add_category_section(3, cat3)
     add_category_section(4, cat4)
     add_category_section(5, cat5)
@@ -1065,7 +1122,6 @@ left_col, right_col = st.columns([1.15, 0.85], gap="large")
 with left_col:
     with st.container(border=True):
         st.markdown("### Maklumat Mesyuarat")
-
         st.markdown("**Maklumat mesyuarat**")
         meeting_info = st.text_input("", value="", key="meeting_info", label_visibility="collapsed")
 
@@ -1090,6 +1146,8 @@ with left_col:
             with u2:
                 st.markdown("**UT Akhir (dd/mm/yyyy)**")
                 ut_akhir_str = st.text_input("", value="", key="ut_akhir", label_visibility="collapsed")
+
+        debug_mode = st.checkbox("Debug Mode (untuk semak kenapa row exclude)", value=False)
 
 with right_col:
     with st.container(border=True):
@@ -1122,7 +1180,8 @@ if gen:
         ut_start = _parse_ddmmyyyy(ut_mula_str)
         ut_end = _parse_ddmmyyyy(ut_akhir_str)
     else:
-        ut_start, ut_end = None, None
+        ut_start = None
+        ut_end = None
 
     if not agenda_file:
         st.error("Sila upload Agenda JK OSC (.docx).")
@@ -1155,18 +1214,18 @@ if gen:
     agenda_osc_set, agenda_nama_set = parse_agenda_docx(agenda_bytes)
 
     rows = []
-    dbg_all = []
+    debug_sheet = []
 
-    r_spu, d_spu = read_kertas_excel(spu_bytes, "SPU")
-    r_sps, d_sps = read_kertas_excel(sps_bytes, "SPS")
-    r_spt, d_spt = read_kertas_excel(spt_bytes, "SPT")
+    r_spu, d_spu = read_kertas_excel(spu_bytes, "SPU", debug=debug_mode)
+    r_sps, d_sps = read_kertas_excel(sps_bytes, "SPS", debug=debug_mode)
+    r_spt, d_spt = read_kertas_excel(spt_bytes, "SPT", debug=debug_mode)
 
     rows += r_spu + r_sps + r_spt
-    dbg_all += d_spu + d_sps + d_spt
+    debug_sheet += d_spu + d_sps + d_spt
 
     rows = enrich_rows(rows)
 
-    cat1, cat2, cat3, cat4, cat5 = build_categories(
+    cat1, cat2, cat3, cat4, cat5, debug_rows = build_categories(
         rows=rows,
         agenda_osc_set=agenda_osc_set,
         agenda_nama_set=agenda_nama_set,
@@ -1206,17 +1265,24 @@ if gen:
             "Kategori 3": len(cat3),
             "Kategori 4": len(cat4),
             "Kategori 5": len(cat5),
+            "Jumlah Row Dibaca (Excel)": len(rows),
+            "Agenda OSC match (count)": len(agenda_osc_set),
+            "Agenda Tetuan match (count)": len(agenda_nama_set),
         })
 
-    with st.expander("DEBUG: bacaan Excel (sheet mana OK / mana skip)"):
-        dbg_df = pd.DataFrame(dbg_all)
-        st.dataframe(dbg_df, use_container_width=True)
+    if debug_mode:
+        with st.expander("DEBUG: Column detect setiap sheet"):
+            if debug_sheet:
+                st.dataframe(pd.DataFrame(debug_sheet), use_container_width=True)
+            else:
+                st.info("Tiada debug sheet.")
 
-        # Optional: dump semua rows yang dibaca (senang verify)
-        all_df = pd.DataFrame(rows)
-        st.download_button(
-            "Download DEBUG (semua rows dibaca) - CSV",
-            data=all_df.to_csv(index=False).encode("utf-8"),
-            file_name="debug_all_rows.csv",
-            mime="text/csv",
-        )
+        with st.expander("DEBUG: Row yang EXCLUDE + sebab"):
+            if debug_rows:
+                # susun kolum supaya senang baca
+                df_dbg = pd.DataFrame(debug_rows)
+                cols_pref = ["daerah", "sheet", "fail_no_raw", "pemohon", "km_date", "ut_date", "belum", "keputusan", "reason_exclude"]
+                cols_show = [c for c in cols_pref if c in df_dbg.columns] + [c for c in df_dbg.columns if c not in cols_pref]
+                st.dataframe(df_dbg[cols_show], use_container_width=True)
+            else:
+                st.info("Tiada row exclude direkod.")
