@@ -57,9 +57,6 @@ BGN_CODES = {"BGN", "EVCB", "EV", "TELCO"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
 
-# Placeholder yang dianggap "kosong"
-PLACEHOLDER_EMPTY = {"", "-", "–", "—", "na", "n/a", "nil", "tiada"}
-
 
 # ============================================================
 # UI HELPERS (BACKGROUND + CSS)
@@ -107,9 +104,7 @@ def _inject_bg_and_css(img_path: str) -> bool:
 
     css = f"""
     <style>
-      html, body {{
-        height: 100%;
-      }}
+      html, body {{ height: 100%; }}
 
       body {{
         overflow-y: scroll;
@@ -208,6 +203,24 @@ def clean_str(v) -> str:
     return str(v).strip()
 
 
+def is_blankish_text(v) -> bool:
+    """
+    Anggap kosong jika: None / "" / "-" / "—" / "–" / "N/A" / "NA" / "TIADA" / "NIL"
+    """
+    if v is None or is_nan(v):
+        return True
+    s = str(v).strip()
+    if s == "":
+        return True
+    s2 = s.lower()
+    if s2 in {"-", "—", "–", "n/a", "na", "nil", "tiada"}:
+        return True
+    # kadang staf letak dash dengan ruang
+    if re.fullmatch(r"[-–—\s]+", s):
+        return True
+    return False
+
+
 def parse_date_from_cell(val) -> Optional[dt.date]:
     """Terima datetime/date/excel-serial/string seperti '73 Hari (27/12/2025)'."""
     if val is None or (isinstance(val, float) and math.isnan(val)):
@@ -263,25 +276,22 @@ def nama_norm(x: str) -> str:
 
 
 def keputusan_is_empty(v) -> bool:
-    """True hanya jika kosong / '-' / placeholder."""
+    """
+    Keputusan dianggap "kosong" jika:
+    - empty / dash / tiada / nil / n/a
+    Jika ada apa-apa teks lain (batal/tarik balik/lulus/tolak/dll) -> dianggap ADA keputusan.
+    """
     if v is None or is_nan(v):
         return True
     s = str(v).strip()
-    if s == "" or s == "-" or s.lower() in {"tiada", "nil", "n/a", "na"}:
+    if s == "" or s.lower() in {"-", "tiada", "nil", "n/a", "na", "—", "–"}:
         return True
+    if re.fullmatch(r"[-–—\s]+", s):
+        return True
+    # Jika ada tarikh atau apa-apa isi lain -> dianggap ada keputusan
     if parse_date_from_cell(s) is not None:
         return False
     return False
-
-
-def belum_has_value(belum_text: str) -> bool:
-    """Kolum 'Belum memberi ulasan' hanya dikira ada isi jika bukan placeholder (termasuk '-' dianggap kosong)."""
-    s = (belum_text or "").strip()
-    if not s:
-        return False
-    if s.lower().strip() in PLACEHOLDER_EMPTY:
-        return False
-    return True
 
 
 def is_serentak(sheet_name: str, fail_no: str) -> bool:
@@ -342,7 +352,18 @@ def perkara_3lines(d: Optional[dt.date]) -> str:
 
 
 def tindakan_ut(belum_text: str) -> str:
-    raw = (belum_text or "").strip()
+    """
+    Convert list jabatan dari kolum "Belum memberi ulasan" -> TINDAKAN.
+    - Jika kod dalaman: tukar jadi "Pengarah ...."
+    - Jika luaran: kekal ringkas (uppercase)
+    - Anggap '-' / kosong sebagai TIADA
+    """
+    if is_blankish_text(belum_text):
+        return ""
+
+    raw = str(belum_text).strip()
+
+    # pecahkan ikut pemisah biasa
     parts = [p.strip() for p in re.split(r"[,&/]+", raw) if p.strip()]
 
     internal_map = {
@@ -355,10 +376,13 @@ def tindakan_ut(belum_text: str) -> str:
         "PBRN": "Pengarah Perbandaran",
         "LESEN": "Pengarah Pelesenan",
         "JL": "Pengarah Landskap",
+        # boleh tambah lagi jika perlu
     }
 
     internal, external = [], []
     for p in parts:
+        if is_blankish_text(p):
+            continue
         key = re.sub(r"\s+", "", p.upper())
         if key in internal_map:
             internal.append(internal_map[key])
@@ -375,7 +399,9 @@ def tindakan_ut(belum_text: str) -> str:
 
     internal = dedup(internal)
     external = dedup(external)
-    return "\n".join(internal + external) if (internal or external) else "-"
+
+    tindakan = "\n".join(internal + external).strip()
+    return tindakan
 
 
 # ============================================================
@@ -404,7 +430,11 @@ def parse_agenda_docx(file_bytes: bytes) -> Tuple[Set[str], Set[str]]:
             osc_set.add(osc_norm(cand))
 
     nama_set: Set[str] = set()
-    for m in re.finditer(r"\bTetuan\b\s*[:\-]?\s*([A-Za-z0-9&.,()/\-\s]{3,100})", full, flags=re.IGNORECASE):
+    for m in re.finditer(
+        r"\bTetuan\b\s*[:\-]?\s*([A-Za-z0-9&.,()/\-\s]{3,100})",
+        full,
+        flags=re.IGNORECASE,
+    ):
         nm = m.group(1).splitlines()[0].strip()
         nm = re.split(r"\s{2,}", nm)[0].strip()
         if nm:
@@ -437,7 +467,7 @@ COL_CANDIDATES = {
     "lot": ["lot"],
     "km": ["tempohuntukprosesolehjabataninduk", "tempohuntukproses"],
     "ut": ["tempohuntukdiberiulasanolehjabatanteknikal", "tempohuntukdiberiulasan"],
-    "belum": ["belummemberikeputusanulasan", "ygbelummemberikeputusan", "belummemberi"],
+    "belum": ["jabatanindukteknikalygbelummemberikeputusanulasansehinggakini", "belummemberikeputusanulasan", "ygbelummemberikeputusan", "belummemberi"],
     "keputusan": ["tarikhkeputusankuasa", "tarikhkeputusan"],
 }
 
@@ -451,7 +481,7 @@ def norm_basic(s: str) -> str:
 
 
 def find_header_row(excel_bytes: bytes, sheet: str) -> Tuple[Optional[int], int]:
-    raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=None, engine="openpyxl", nrows=40)
+    raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=None, engine="openpyxl", nrows=60)
     best_idx, best_score = None, 0
     for i in range(len(raw)):
         row = raw.iloc[i].astype(str).fillna("")
@@ -553,15 +583,16 @@ def build_categories(
     ut_start: dt.date,
     ut_end: dt.date,
     ut_enabled: bool,
+    agenda_enabled: bool,
 ) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
-    # tapis global keputusan
+    # tapis global keputusan (kalau ada keputusan -> buang terus)
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
-    # tapis Agenda (jika agenda_set tidak kosong)
-    if agenda_osc_set or agenda_nama_set:
+    # tapis agenda (jika agenda digunakan)
+    if agenda_enabled:
         rows = [r for r in rows if (r["osc_norm"] not in agenda_osc_set) and (r["nama_norm"] not in agenda_nama_set)]
 
-    # group by fail_induk
+    # group by fail_induk (untuk handle serentak & dedup)
     by_induk: Dict[str, List[dict]] = {}
     for r in rows:
         by_induk.setdefault(r["fail_induk"], []).append(r)
@@ -601,7 +632,9 @@ def build_categories(
         jenis_ser = (f"{codes_join} {label_txt} (Serentak)".strip() if label_txt else f"{codes_join} (Serentak)").strip()
         fail_no_ser = f"{induk}-{codes_join}" if codes_join else induk
 
+        # ----------------------------
         # KATEGORI 1 — KM (PB/BGN)
+        # ----------------------------
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & (PB_CODES - {"PS", "SB", "CT"}):
                 cat1.append(make_rec(1, "Pengarah Perancang Bandar", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-PB"))
@@ -619,18 +652,36 @@ def build_categories(
                     jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat1.append(make_rec(1, "Pengarah Bangunan", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-BGN"))
 
-        # KATEGORI 2 — UT (SEMUA SHEET: serentak sampai LJUP, ikut UT range + belum ada isi)
+        # ----------------------------
+        # KATEGORI 2 — UT (SEMUA SHEET)
+        # Syarat:
+        # - ut_date dalam range UT
+        # - kolum "Belum memberi ulasan" mesti ADA isi sebenar (bukan kosong / '-' / '—')
+        # - keputusan mesti kosong (dah ditapis awal)
+        # ----------------------------
         if ut_enabled:
             for g in grp:
-                if in_range(g.get("ut_date"), ut_start, ut_end):
-                    if belum_has_value(g.get("belum", "")):
-                        tindakan = tindakan_ut(g["belum"])
-                        perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {g['ut_date'].strftime('%d.%m.%Y')}."
-                        jenis = (jenis_ser if is_ser else g["sheet"]) + (f" {g['label']}" if g["label"] else "")
-                        fail_no = (fail_no_ser if is_ser else g["fail_no_raw"])
-                        cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, g["belum"].strip()))
+                if not in_range(g.get("ut_date"), ut_start, ut_end):
+                    continue
 
+                if is_blankish_text(g.get("belum")):
+                    continue  # kosong -> tak masuk
+
+                tindakan = tindakan_ut(g.get("belum", ""))
+                if is_blankish_text(tindakan):
+                    continue  # kalau tinggal '-' saja
+
+                perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {g['ut_date'].strftime('%d.%m.%Y')}."
+                jenis = (jenis_ser if is_ser else g["sheet"]) + (f" {g['label']}" if g["label"] else "")
+                fail_no = (fail_no_ser if is_ser else g["fail_no_raw"])
+
+                # extra_key: gabung ikut tindakan+ut_date supaya tak duplicate pelik
+                extra_key = f"{tindakan}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
+                cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, extra_key))
+
+        # ----------------------------
         # KATEGORI 3/4/5 — KM
+        # ----------------------------
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & KEJ_CODES:
                 cat3.append(make_rec(3, "Pengarah Kejuruteraan", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-KEJ"))
@@ -644,9 +695,11 @@ def build_categories(
                 if in_range(g.get("km_date"), km_start, km_end) and (g["sheet"].strip().upper() in {"KTUP", "JP", "LJUP"}):
                     jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat3.append(make_rec(3, "Pengarah Kejuruteraan", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), f"NS-{g['sheet']}"))
+
                 if in_range(g.get("km_date"), km_start, km_end) and (g["sheet"].strip().upper() == "PL"):
                     jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat4.append(make_rec(4, "Pengarah Landskap", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-PL"))
+
                 if in_range(g.get("km_date"), km_start, km_end) and (g["sheet"].strip().upper() in {"PS", "SB", "CT"}):
                     jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat5.append(make_rec(5, "Pengarah Perancang Bandar", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), f"NS-{g['sheet']}"))
@@ -663,7 +716,7 @@ def build_categories(
     cat1, cat2, cat3, cat4, cat5 = map(dedup_list, [cat1, cat2, cat3, cat4, cat5])
 
     cat1.sort(key=lambda r: (0 if r["tindakan"].startswith("Pengarah Perancang") else 1, DAERAH_ORDER.get(r["daerah"], 9), r["fail_no"]))
-    cat2.sort(key=lambda r: (DAERAH_ORDER.get(r["daerah"], 9), r["fail_no"]))
+    cat2.sort(key=lambda r: (DAERAH_ORDER.get(r["daerah"], 9), r["fail_no"], r["tindakan"]))
     cat3.sort(key=lambda r: (DAERAH_ORDER.get(r["daerah"], 9), r["fail_no"]))
     cat4.sort(key=lambda r: (DAERAH_ORDER.get(r["daerah"], 9), r["fail_no"]))
     cat5.sort(key=lambda r: (DAERAH_ORDER.get(r["daerah"], 9), r["fail_no"]))
@@ -978,10 +1031,8 @@ def build_word_doc(
         fill_table(tbl, recs)
 
     add_category_section(1, cat1)
-
     if ut_enabled:
         add_category_section(2, cat2)
-
     add_category_section(3, cat3)
     add_category_section(4, cat4)
     add_category_section(5, cat5)
@@ -994,9 +1045,6 @@ def build_word_doc(
 # ============================================================
 # STREAMLIT UI
 # ============================================================
-if "_is_generating" not in st.session_state:
-    st.session_state["_is_generating"] = False
-
 bg_ok = _inject_bg_and_css("assets/bg.jpg")
 if not bg_ok:
     st.warning("Background tidak dijumpai. Pastikan fail ada di folder assets/ (contoh: assets/bg.jpg).")
@@ -1004,12 +1052,14 @@ if not bg_ok:
 st.markdown("<h1 class='app-title'>LAMPIRAN G UNIT OSC</h1>", unsafe_allow_html=True)
 st.markdown("<div class='hero-spacer'></div>", unsafe_allow_html=True)
 
+if "running" not in st.session_state:
+    st.session_state.running = False
+
 left_col, right_col = st.columns([1.15, 0.85], gap="large")
 
 with left_col:
     with st.container(border=True):
         st.markdown("### Maklumat Mesyuarat")
-
         st.markdown("**Maklumat mesyuarat**")
         meeting_info = st.text_input("", value="", key="meeting_info", label_visibility="collapsed")
 
@@ -1040,118 +1090,102 @@ with right_col:
         st.markdown("### Muat Naik Fail")
 
         st.markdown("**Agenda JK OSC (.docx)**")
-        proceed_without_agenda = st.checkbox("Teruskan tanpa Agenda", value=False)
+        agenda_file = st.file_uploader("", type=["docx"], key="agenda_docx", label_visibility="collapsed")
 
-        # Kalau tick, agenda jadi optional (boleh upload atau kosong)
-        agenda_file = st.file_uploader(
-            "",
-            type=["docx"],
-            key="agenda_docx",
-            label_visibility="collapsed",
-            disabled=False,
-        )
+        proceed_without_agenda = st.checkbox("Teruskan tanpa Agenda", value=False, help="Tick jika agenda belum diterima. Sistem akan jana tanpa tapisan agenda.")
 
-        if proceed_without_agenda:
-            st.caption("Agenda tidak wajib. Sistem akan jana Lampiran G tanpa tapisan agenda (boleh buang manual bila agenda diterima).")
-        else:
-            st.caption("Agenda wajib untuk tapisan. Jika agenda belum ada, tick 'Teruskan tanpa Agenda'.")
+        st.markdown("**Kertas Maklumat (Excel) — SPU/SPS/SPT (boleh upload 1 atau 2 fail setiap daerah)**")
+        st.caption("Nota: Hujung/awal tahun boleh jadi 2 fail (tahun lama + tahun baru). Sistem akan gabungkan.")
 
-        st.markdown("**Kertas Maklumat (Excel) — WAJIB 3 fail**")
-        st.markdown("**SPU**")
-        spu_file = st.file_uploader("", type=["xlsx", "xlsm", "xls"], key="spu", label_visibility="collapsed")
-        st.markdown("**SPS**")
-        sps_file = st.file_uploader("", type=["xlsx", "xlsm", "xls"], key="sps", label_visibility="collapsed")
-        st.markdown("**SPT**")
-        spt_file = st.file_uploader("", type=["xlsx", "xlsm", "xls"], key="spt", label_visibility="collapsed")
+        st.markdown("**SPU (maks 2 fail)**")
+        spu_files = st.file_uploader("", type=["xlsx", "xlsm"], key="spu_multi", label_visibility="collapsed", accept_multiple_files=True)
+
+        st.markdown("**SPS (maks 2 fail)**")
+        sps_files = st.file_uploader("", type=["xlsx", "xlsm"], key="sps_multi", label_visibility="collapsed", accept_multiple_files=True)
+
+        st.markdown("**SPT (maks 2 fail)**")
+        spt_files = st.file_uploader("", type=["xlsx", "xlsm"], key="spt_multi", label_visibility="collapsed", accept_multiple_files=True)
 
 mid = st.columns([1, 0.55, 1])[1]
 with mid:
-    gen = st.button(
-        "JANA LAMPIRAN G",
-        type="primary",
-        disabled=st.session_state["_is_generating"],
-    )
+    gen = st.button("JANA LAMPIRAN G", type="primary", disabled=st.session_state.running)
 
 
 # ============================================================
 # ACTION (GENERATE)
 # ============================================================
 if gen:
-    # lock untuk elak double click
-    if st.session_state["_is_generating"]:
-        st.warning("Sedang jana… sila tunggu.")
-        st.stop()
-
-    st.session_state["_is_generating"] = True
-
+    st.session_state.running = True
     try:
-        km_start = _parse_ddmmyyyy(km_mula_str)
-        km_end = _parse_ddmmyyyy(km_akhir_str)
+        with st.spinner("Sedang jana Lampiran G... Sila tunggu."):
+            km_start = _parse_ddmmyyyy(km_mula_str)
+            km_end = _parse_ddmmyyyy(km_akhir_str)
 
-        if ut_enabled:
-            ut_start = _parse_ddmmyyyy(ut_mula_str)
-            ut_end = _parse_ddmmyyyy(ut_akhir_str)
-        else:
-            ut_start = None
-            ut_end = None
+            if ut_enabled:
+                ut_start = _parse_ddmmyyyy(ut_mula_str)
+                ut_end = _parse_ddmmyyyy(ut_akhir_str)
+            else:
+                ut_start = None
+                ut_end = None
 
-        # VALIDATION
-        if not (spu_file and sps_file and spt_file):
-            st.error("Sila upload 3 fail Kertas Maklumat (SPU, SPS, SPT).")
-            st.stop()
+            # Validasi Agenda
+            agenda_enabled = True
+            if proceed_without_agenda:
+                agenda_enabled = False
+            else:
+                if not agenda_file:
+                    st.error("Sila upload Agenda JK OSC (.docx) atau tick 'Teruskan tanpa Agenda'.")
+                    st.stop()
 
-        if not proceed_without_agenda and not agenda_file:
-            st.error("Sila upload Agenda JK OSC (.docx) atau tick 'Teruskan tanpa Agenda'.")
-            st.stop()
+            # Validasi kertas maklumat (multi upload)
+            spu_files = spu_files or []
+            sps_files = sps_files or []
+            spt_files = spt_files or []
 
-        if km_start is None or km_end is None:
-            st.error("Sila isi tarikh KM Mula dan KM Akhir dalam format dd/mm/yyyy.")
-            st.stop()
-        if km_start > km_end:
-            st.error("KM Mula tidak boleh lebih besar daripada KM Akhir.")
-            st.stop()
-
-        if ut_enabled:
-            if ut_start is None or ut_end is None:
-                st.error("Sila isi tarikh UT Mula dan UT Akhir dalam format dd/mm/yyyy.")
-                st.stop()
-            if ut_start > ut_end:
-                st.error("UT Mula tidak boleh lebih besar daripada UT Akhir.")
+            if len(spu_files) == 0 or len(sps_files) == 0 or len(spt_files) == 0:
+                st.error("Sila upload sekurang-kurangnya 1 fail untuk setiap SPU, SPS dan SPT.")
                 st.stop()
 
-        # LOADING / STATUS
-        status_obj = None
-        try:
-            status_obj = st.status("Sedang jana Lampiran G…", expanded=True)
-        except Exception:
-            status_obj = None
+            if len(spu_files) > 2 or len(sps_files) > 2 or len(spt_files) > 2:
+                st.error("Maksimum 2 fail dibenarkan bagi setiap daerah (SPU/SPS/SPT).")
+                st.stop()
 
-        with st.spinner("Sedang proses data & jana Lampiran G… (lebih kurang 10–20 saat)"):
-            # READ BYTES
-            spu_bytes = spu_file.read()
-            sps_bytes = sps_file.read()
-            spt_bytes = spt_file.read()
+            # Validasi tarikh KM/UT
+            if km_start is None or km_end is None:
+                st.error("Sila isi tarikh KM Mula dan KM Akhir dalam format dd/mm/yyyy.")
+                st.stop()
+            if km_start > km_end:
+                st.error("KM Mula tidak boleh lebih besar daripada KM Akhir.")
+                st.stop()
 
-            # AGENDA OPTIONAL
-            if agenda_file:
-                if status_obj:
-                    status_obj.update(label="Baca agenda…")
+            if ut_enabled:
+                if ut_start is None or ut_end is None:
+                    st.error("Sila isi tarikh UT Mula dan UT Akhir dalam format dd/mm/yyyy.")
+                    st.stop()
+                if ut_start > ut_end:
+                    st.error("UT Mula tidak boleh lebih besar daripada UT Akhir.")
+                    st.stop()
+
+            # Read agenda (jika digunakan)
+            if agenda_enabled:
                 agenda_bytes = agenda_file.read()
                 agenda_osc_set, agenda_nama_set = parse_agenda_docx(agenda_bytes)
             else:
                 agenda_osc_set, agenda_nama_set = set(), set()
 
-            if status_obj:
-                status_obj.update(label="Baca kertas maklumat (SPU/SPS/SPT)…")
-
+            # Read all excel files
             rows = []
-            rows += read_kertas_excel(spu_bytes, "SPU")
-            rows += read_kertas_excel(sps_bytes, "SPS")
-            rows += read_kertas_excel(spt_bytes, "SPT")
-            rows = enrich_rows(rows)
 
-            if status_obj:
-                status_obj.update(label="Bina kategori 1–5…")
+            for f in spu_files:
+                rows += read_kertas_excel(f.read(), "SPU")
+
+            for f in sps_files:
+                rows += read_kertas_excel(f.read(), "SPS")
+
+            for f in spt_files:
+                rows += read_kertas_excel(f.read(), "SPT")
+
+            rows = enrich_rows(rows)
 
             cat1, cat2, cat3, cat4, cat5 = build_categories(
                 rows=rows,
@@ -1162,10 +1196,8 @@ if gen:
                 ut_start=ut_start if ut_enabled else km_start,
                 ut_end=ut_end if ut_enabled else km_end,
                 ut_enabled=ut_enabled,
+                agenda_enabled=agenda_enabled,
             )
-
-            if status_obj:
-                status_obj.update(label="Jana Word (Lampiran G)…")
 
             doc_bytes = build_word_doc(
                 meeting_info=meeting_info.strip() if meeting_info.strip() else "JK OSC",
@@ -1181,27 +1213,22 @@ if gen:
                 ut_enabled=ut_enabled,
             )
 
-        if status_obj:
-            status_obj.update(label="Siap.", state="complete", expanded=False)
+            st.success("Lampiran G berjaya dijana.")
+            st.download_button(
+                "Muat turun Lampiran G (Word)",
+                data=doc_bytes,
+                file_name="Lampiran_G.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
 
-        st.success("Lampiran G berjaya dijana.")
-        st.download_button(
-            "Muat turun Lampiran G (Word)",
-            data=doc_bytes,
-            file_name="Lampiran_G.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-
-        with st.expander("Ringkasan (untuk semakan cepat)"):
-            st.write({
-                "Kategori 1": len(cat1),
-                "Kategori 2": len(cat2) if ut_enabled else 0,
-                "Kategori 3": len(cat3),
-                "Kategori 4": len(cat4),
-                "Kategori 5": len(cat5),
-                "Agenda digunakan?": bool(agenda_file),
-                "Mode tanpa agenda?": bool(proceed_without_agenda and not agenda_file),
-            })
-
+            with st.expander("Ringkasan (untuk semakan cepat)"):
+                st.write({
+                    "Kategori 1": len(cat1),
+                    "Kategori 2": len(cat2) if ut_enabled else 0,
+                    "Kategori 3": len(cat3),
+                    "Kategori 4": len(cat4),
+                    "Kategori 5": len(cat5),
+                    "Agenda digunakan?": "YA" if agenda_enabled else "TIDAK (Teruskan tanpa Agenda)",
+                })
     finally:
-        st.session_state["_is_generating"] = False
+        st.session_state.running = False
