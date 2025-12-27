@@ -156,7 +156,7 @@ def _inject_bg_and_css(img_path: str) -> bool:
 
       /* Spacer hero (tolak panel ke bawah ~50% page) */
       .hero-spacer {{
-        height: 22vh;   /* naikkan jika nak lagi bawah (contoh 26vh) */
+        height: 10vh;   /* naikkan jika nak lagi bawah (contoh 26vh) */
       }}
 
       /* Panel kemas guna st.container(border=True) */
