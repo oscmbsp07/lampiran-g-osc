@@ -1,0 +1,1 @@
+# lampiran-g-osc
