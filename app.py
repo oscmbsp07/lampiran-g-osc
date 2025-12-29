@@ -67,6 +67,25 @@ UT_ALLOWED_SHEETS = {"SERENTAK", "PKM", "BGN", "BGN EVCB", "TKR-GUNA", "PKM TUKA
 # hanya benarkan jika "Tempoh Untuk Proses Oleh Jabatan Induk*" menunjuk induk PB/PKM/BGN.
 SERENTAK_UT_ALLOWED_INDUK = {"PB", "PKM", "BGN"}
 
+# Mapping sheet gabungan -> kod yang patut masuk union
+SHEET_CODE_MAP = {
+    "PKM TUKARGUNA": {"PKM", "TKR-GUNA"},
+    "BGN EVCB": {"BGN", "EVCB"},
+}
+
+# PTJ keywords (boleh tambah ikut keperluan)
+PTJ_KEYWORDS = {
+    "PTJ",
+    "MBSP",
+    "MAJLIS",
+    "PBT",
+    "PERBADANAN",
+    "JABATAN",
+    "KERAJAAN",
+    "PEJABAT",
+    "UNIT",
+    "BAHAGIAN",
+}
 
 # ============================================================
 # UI HELPERS (BACKGROUND + CSS)
@@ -288,17 +307,70 @@ def in_range(d: Optional[dt.date], start: dt.date, end: dt.date) -> bool:
 
 
 def osc_norm(x: str) -> str:
+    """
+    Normalisasi fail OSC untuk matching.
+    Fix penting: MBPS dianggap sama seperti MBSP.
+    """
     s = str(x or "").lower()
     s = re.sub(r"[\s\r\n\t]+", "", s)
+
+    # Normalize common typo: MBPS -> MBSP
+    s = s.replace("mbps", "mbsp")
+
+    # buang simbol
     s = re.sub(r"[-/\\()\[\]{}+.,:;]", "", s)
     return s
 
 
+def lot_norm(x: str) -> str:
+    """
+    Normalisasi lot untuk fallback match.
+    Kekalkan nombor/letter + slash (kalau ada); buang perkataan 'LOT', 'NO', dll.
+    """
+    s = str(x or "").upper()
+    s = s.replace("\n", " ")
+    s = re.sub(r"\b(NO\.?|NO|NOMBOR)\b", " ", s)
+    s = re.sub(r"\bLOT\b", " ", s)
+    s = re.sub(r"\s+", "", s)
+    # buang simbol kecuali slash
+    s = re.sub(r"[^A-Z0-9/]", "", s)
+    return s.strip()
+
+
+def nama_norm_for_match(x: str) -> str:
+    """
+    Nama untuk fallback match (bukan untuk tapisan utama).
+    Buang perkataan biasa syarikat supaya typo kecil tak terlalu mengganggu.
+    """
+    s = str(x or "").lower()
+    s = re.sub(r"\b(tetuan|tuan|puan)\b", "", s)
+    s = re.sub(r"\b(sdn\.?\s*bhd\.?|sdn\s*bhd|bhd|berhad|enterprise|enterprises|plc|llp|ltd)\b", "", s)
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s.strip()
+
+
+def is_ptj_pemohon(pemohon: str) -> bool:
+    """
+    PTJ special case: kalau pemohon nampak macam PTJ/agensi.
+    Default agak ketat: perlu ada keyword kuat (PTJ/MBSP/MAJLIS/PBT/PERBADANAN).
+    """
+    s = str(pemohon or "").upper()
+    if not s.strip():
+        return False
+    strong = {"PTJ", "MBSP", "MAJLIS", "PBT", "PERBADANAN"}
+    if any(k in s for k in strong):
+        return True
+    # fallback long name gov/office
+    if any(k in s for k in {"JABATAN", "KERAJAAN", "PEJABAT"}):
+        return True
+    return False
+
+
 def keputusan_is_empty(v) -> bool:
     """
-    Keputusan dianggap kosong jika:
-    - empty / dash / tiada / nil / n/a
-    Jika ada apa-apa teks lain atau tarikh -> dianggap ADA keputusan.
+    Kekalkan behavior asal (untuk elak output berubah drastik):
+    - empty/dash/tiada/nil/n/a -> kosong
+    - selain itu -> dianggap ADA keputusan (akan dibuang)
     """
     if v is None or is_nan(v):
         return True
@@ -307,8 +379,10 @@ def keputusan_is_empty(v) -> bool:
         return True
     if re.fullmatch(r"[-–—\s]+", s):
         return True
+    # jika tarikh ada, memang keputusan ada
     if parse_date_from_cell(s) is not None:
         return False
+    # jika ada apa-apa teks lain, treat sebagai keputusan ada (asal)
     return False
 
 
@@ -326,12 +400,16 @@ def is_serentak(sheet_name: str, fail_no: str) -> bool:
 def extract_codes(fail_no: str, sheet_name: str) -> Set[str]:
     s = str(fail_no or "")
     tokens = re.split(r"[\s\+\-/\\(),]+", s.upper())
-    codes: Set[str] = set()
-    for t in tokens:
-        if t in KNOWN_CODES:
-            codes.add(t)
+    codes: Set[str] = set(t for t in tokens if t in KNOWN_CODES)
 
     sn = sheet_norm(sheet_name)
+
+    # sheet gabungan
+    if sn in SHEET_CODE_MAP:
+        codes |= SHEET_CODE_MAP[sn]
+        return codes
+
+    # sheet biasa
     if sn == "BGN EVCB":
         codes.add("BGN")
         codes.add("EVCB")
@@ -381,7 +459,7 @@ def tindakan_ut(belum_text: str) -> str:
         return ""
 
     raw = str(belum_text).strip()
-    parts = [p.strip() for p in re.split(r"[,&/]+", raw) if p.strip()]
+    parts = [p.strip() for p in re.split(r"[,&/;\n]+", raw) if p.strip()]
 
     internal_map = {
         "KEJ": "Pengarah Kejuruteraan",
@@ -419,40 +497,133 @@ def tindakan_ut(belum_text: str) -> str:
 
 
 # ============================================================
-# AGENDA PARSER (WORD .docx)
+# AGENDA PARSER (WORD .docx) - PADU
 # ============================================================
-OSC_PATTERN = re.compile(r"MBSP[0-9A-Z/\-\+\s]{10,120}", flags=re.IGNORECASE)
+# Tangkap MBSP/MBPS dengan lebih selamat
+OSC_PATTERN = re.compile(
+    r"\bMB(?:SP|PS)[0-9A-Z/\-\+]{8,140}\b",
+    flags=re.IGNORECASE
+)
 
-def parse_agenda_docx(file_bytes: bytes) -> Set[str]:
-    """
-    Tapisan agenda ikut arahan terbaru:
-    - Jangan tapis ikut 'Tetuan' (nama pemaju) sebab boleh tersalah buang (contoh: Bertam/ PTJ).
-    - Hanya guna padanan No. Rujukan OSC yang betul.
-    """
-    doc = Document(io.BytesIO(file_bytes))
-    texts: List[str] = []
+# Detect start item agenda
+ITEM_START_PATTERN = re.compile(r"\bKERTAS\s+MESYUARAT\s+BIL\.?\b", flags=re.IGNORECASE)
 
+# Lot pattern (flexible)
+LOT_PATTERN = re.compile(r"\bLOT\b[^A-Z0-9/]{0,10}([A-Z0-9/ \-]{1,60})", flags=re.IGNORECASE)
+
+# Lines that declare No Rujukan OSC explicitly "-" / TIADA
+NO_OSC_MISSING_PATTERN = re.compile(r"\bNO\.?\s*RUJUKAN\s*OSC\b.*[:\-]\s*(\-|TIADA|N/?A)\b", flags=re.IGNORECASE)
+
+# Extract pemohon
+PEMOHON_LINE_PATTERN = re.compile(r"\b(TETUAN|PEMOHON|PEMAJU)\b\s*[:\-]?\s*(.+)", flags=re.IGNORECASE)
+
+
+def _docx_all_text_in_order(doc: Document) -> List[str]:
+    """
+    Ambil text docx dalam urutan agak stabil:
+    - paragraphs
+    - tables (row by row)
+    """
+    lines: List[str] = []
     for p in doc.paragraphs:
-        if p.text:
-            texts.append(p.text)
+        t = (p.text or "").strip()
+        if t:
+            lines.append(t)
 
     for t in doc.tables:
         for row in t.rows:
             for cell in row.cells:
-                if cell.text:
-                    texts.append(cell.text)
+                ct = (cell.text or "").strip()
+                if ct:
+                    # split per line supaya item grouping lebih kemas
+                    for sub in re.split(r"[\r\n]+", ct):
+                        sub = sub.strip()
+                        if sub:
+                            lines.append(sub)
+    return lines
 
-    full = "\n".join(texts)
+
+@st.cache_data(show_spinner=False)
+def parse_agenda_docx(file_bytes: bytes) -> Tuple[Set[str], Set[Tuple[str, str]], List[dict]]:
+    """
+    Output:
+    - osc_set: set of osc_norm("MBSP/...-PKM")
+    - fallback_pairs: set of (lot_norm, nama_norm_for_match) untuk kes No Rujukan OSC '-' / tiada
+    - items: debug list
+    """
+    doc = Document(io.BytesIO(file_bytes))
+    lines = _docx_all_text_in_order(doc)
+
+    # group by agenda items
+    items: List[dict] = []
+    cur: List[str] = []
+    for ln in lines:
+        if ITEM_START_PATTERN.search(ln):
+            if cur:
+                items.append({"blob": "\n".join(cur)})
+            cur = [ln]
+        else:
+            if cur:
+                cur.append(ln)
+    if cur:
+        items.append({"blob": "\n".join(cur)})
 
     osc_set: Set[str] = set()
-    for m in OSC_PATTERN.finditer(full):
-        cand = m.group(0)
-        cand = cand.strip(" ,.;")
-        cand = re.sub(r"[\s\r\n\t]+", "", cand)
-        if cand.upper().startswith("MBSP") and "/" in cand and "-" in cand:
-            osc_set.add(osc_norm(cand))
+    fallback_pairs: Set[Tuple[str, str]] = set()
 
-    return osc_set
+    debug_items: List[dict] = []
+
+    for it in items:
+        blob = it["blob"]
+        blob_clean = re.sub(r"\s+", " ", blob).strip()
+
+        # extract OSC numbers
+        osc_hits = []
+        for m in OSC_PATTERN.finditer(blob_clean):
+            cand = m.group(0).strip(" ,.;:()[]{}")
+            cand = re.sub(r"\s+", "", cand)
+            # Normalize MBPS -> MBSP
+            cand = re.sub(r"^MBPS", "MBSP", cand, flags=re.IGNORECASE)
+            if cand.upper().startswith("MBSP") and "/" in cand and "-" in cand:
+                osc_hits.append(cand)
+
+        has_missing_osc = bool(NO_OSC_MISSING_PATTERN.search(blob_clean))
+
+        # pemohon line
+        pemohon_raw = ""
+        for ln in blob.split("\n"):
+            ln = ln.strip()
+            m = PEMOHON_LINE_PATTERN.search(ln)
+            if m:
+                pemohon_raw = (m.group(2) or "").strip()
+                break
+
+        # lot
+        lot_raw = ""
+        mlot = LOT_PATTERN.search(blob_clean)
+        if mlot:
+            lot_raw = (mlot.group(1) or "").strip()
+
+        # add to indices
+        if osc_hits:
+            for osc in osc_hits:
+                osc_set.add(osc_norm(osc))
+        else:
+            # fallback only if explicitly missing or blank osc
+            if has_missing_osc:
+                ln_lot = lot_norm(lot_raw)
+                nm = nama_norm_for_match(pemohon_raw)
+                if ln_lot and nm:
+                    fallback_pairs.add((ln_lot, nm))
+
+        debug_items.append({
+            "osc": osc_hits[:],
+            "missing_osc": has_missing_osc,
+            "pemohon": pemohon_raw,
+            "lot": lot_raw,
+        })
+
+    return osc_set, fallback_pairs, debug_items
 
 
 # ============================================================
@@ -521,6 +692,7 @@ def detect_columns(df: pd.DataFrame) -> Dict[str, str]:
     return found
 
 
+@st.cache_data(show_spinner=False)
 def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
     out: List[dict] = []
     xl = pd.ExcelFile(io.BytesIO(excel_bytes), engine="openpyxl")
@@ -584,6 +756,9 @@ def enrich_rows(rows: List[dict]) -> List[dict]:
         rr["fail_induk"] = split_fail_induk(r["fail_no_raw"])
         rr["osc_norm"] = osc_norm(r["fail_no_raw"])
         rr["sheet_u"] = sheet_norm(r["sheet"])
+        rr["lot_norm"] = lot_norm(r.get("lot", ""))
+        rr["pemohon_norm"] = nama_norm_for_match(r.get("pemohon", ""))
+        rr["is_ptj"] = is_ptj_pemohon(r.get("pemohon", ""))
         out.append(rr)
     return out
 
@@ -601,23 +776,44 @@ def sheet_is_ut_allowed(sheet_u: str) -> bool:
 def build_categories(
     rows: List[dict],
     agenda_osc_set: Set[str],
+    agenda_fallback_pairs: Set[Tuple[str, str]],
     km_start: dt.date,
     km_end: dt.date,
     ut_start: dt.date,
     ut_end: dt.date,
     ut_enabled: bool,
     agenda_enabled: bool,
-) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
+    ptj_exempt_enabled: bool,
+) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict]]:
+
+    audit_removed: List[dict] = []
 
     # 1) Buang yang ada keputusan
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
-    # 2) Tapisan agenda: hanya untuk sheet SERENTAK/PKM/BGN sahaja (ikut arahan terbaru)
-    if agenda_enabled and agenda_osc_set:
-        rows = [
-            r for r in rows
-            if not (r["sheet_u"] in AGENDA_FILTER_SHEETS and r["osc_norm"] in agenda_osc_set)
-        ]
+    # 2) Tapisan agenda: ikut rule padu (No. Rujukan OSC utama; fallback lot+nama bila No OSC '-')
+    if agenda_enabled:
+        kept = []
+        for r in rows:
+            if r["sheet_u"] in AGENDA_FILTER_SHEETS:
+                # PTJ exemption
+                if ptj_exempt_enabled and r.get("is_ptj"):
+                    kept.append(r)
+                    continue
+
+                # main match by OSC
+                if agenda_osc_set and r["osc_norm"] in agenda_osc_set:
+                    audit_removed.append({"fail_no": r.get("fail_no_raw", ""), "pemohon": r.get("pemohon", ""), "reason": "AGENDA: match No Rujukan OSC"})
+                    continue
+
+                # fallback match (only when agenda has missing OSC items)
+                if agenda_fallback_pairs and r.get("lot_norm") and r.get("pemohon_norm"):
+                    if (r["lot_norm"], r["pemohon_norm"]) in agenda_fallback_pairs:
+                        audit_removed.append({"fail_no": r.get("fail_no_raw", ""), "pemohon": r.get("pemohon", ""), "reason": "AGENDA: match fallback LOT+PEMOHON (No OSC '-')"})
+                        continue
+
+            kept.append(r)
+        rows = kept
 
     # group by fail_induk (handle serentak & dedup)
     by_induk: Dict[str, List[dict]] = {}
@@ -625,12 +821,8 @@ def build_categories(
         by_induk.setdefault(r["fail_induk"], []).append(r)
 
     def nama_simplify(x: str) -> str:
-        # untuk dedup sahaja (bukan untuk tapisan agenda)
-        s = str(x or "").lower()
-        s = re.sub(r"\b(tetuan|tuan|puan)\b", "", s)
-        s = re.sub(r"\b(sdn\.?\s*bhd\.?|sdn\s*bhd|bhd|berhad|enterprise|enterprises|plc|llp|ltd)\b", "", s)
-        s = re.sub(r"[^a-z0-9]+", "", s)
-        return s
+        # untuk dedup sahaja
+        return nama_norm_for_match(x)
 
     def make_rec(cat: int, tindakan: str, base_r: dict, jenis: str, fail_no: str, perkara: str, extra_key: str) -> dict:
         return {
@@ -682,12 +874,6 @@ def build_categories(
 
         # ----------------------------
         # KATEGORI 2 — UT (TERHAD)
-        # Syarat:
-        # - sheet mesti: SERENTAK / PKM / BGN / TUKAR GUNA
-        # - ut_date dalam range UT
-        # - kolum "Belum memberi..." mesti ADA isi (bukan kosong/dash)
-        # - keputusan mesti kosong (dah ditapis awal)
-        # - untuk SERENTAK: induk_code (KM) mesti PB/PKM/BGN
         # ----------------------------
         if ut_enabled:
             for g in grp:
@@ -754,13 +940,12 @@ def build_categories(
         for i, r in enumerate(lst, start=1):
             r["bil"] = i
 
-    return cat1, cat2, cat3, cat4, cat5
+    return cat1, cat2, cat3, cat4, cat5, audit_removed
 
 
 # ============================================================
 # WORD FORMATTER
 # ============================================================
-# Lebar kolum dibetulkan supaya header "BIL" dan "DAERAH" tak pecah baris.
 COL_WIDTHS_IN = [0.50, 1.75, 1.55, 1.55, 1.45, 0.75, 0.65, 0.70, 1.99]
 HEADERS = ["BIL", "TINDAKAN", "JENIS\nPERMOHONAN", "FAIL NO", "PEMAJU/PEMOHON", "DAERAH", "MUKIM", "LOT", "PERKARA"]
 
@@ -783,10 +968,6 @@ def _find_font_path(prefer_bold: bool = True) -> Optional[str]:
 
 
 def make_g_logo_png(diameter_px: int = 140, outline_px: int = 4, font_pt: int = 26) -> bytes:
-    """
-    Logo G: Times New Roman Bold, huruf G dibesarkan sedikit (ikut request terbaru).
-    Kalau nak lagi besar: naikkan font_pt (contoh 28/30).
-    """
     scale = 4
     D = diameter_px * scale
     img = Image.new("RGBA", (D, D), (255, 255, 255, 0))
@@ -1145,6 +1326,12 @@ with right_col:
             help="Tick jika agenda belum diterima. Jika tick, sistem jana tanpa tapisan agenda.",
         )
 
+        ptj_exempt_enabled = st.checkbox(
+            "PTJ: Jangan buang permohonan PTJ walaupun ada dalam agenda",
+            value=True,
+            help="Special case PTJ (ikut arahan Unit OSC).",
+        )
+
         st.markdown("**Kertas Maklumat (Excel) — SPU/SPS/SPT (boleh upload 1 atau 2 fail setiap daerah)**")
         st.caption("Nota: Hujung/awal tahun boleh jadi 2 fail (tahun lama + tahun baru). Sistem akan gabungkan.")
 
@@ -1168,7 +1355,7 @@ with mid:
 if gen:
     st.session_state.running = True
     try:
-        with st.spinner("Sedang jana Lampiran G... Sila tunggu."):
+        with st.spinner("Sedang jana Lampiran G..."):
             km_start = _parse_ddmmyyyy(km_mula_str)
             km_end = _parse_ddmmyyyy(km_akhir_str)
 
@@ -1218,35 +1405,36 @@ if gen:
                     st.stop()
 
             # Read agenda (jika digunakan)
+            agenda_osc_set: Set[str] = set()
+            agenda_fallback_pairs: Set[Tuple[str, str]] = set()
+            agenda_debug_items: List[dict] = []
+
             if agenda_enabled:
-                agenda_bytes = agenda_file.read()
-                agenda_osc_set = parse_agenda_docx(agenda_bytes)
-            else:
-                agenda_osc_set = set()
+                agenda_bytes = agenda_file.getvalue()
+                agenda_osc_set, agenda_fallback_pairs, agenda_debug_items = parse_agenda_docx(agenda_bytes)
 
             # Read all excel files
             rows: List[dict] = []
-
             for f in spu_files:
-                rows += read_kertas_excel(f.read(), "SPU")
-
+                rows += read_kertas_excel(f.getvalue(), "SPU")
             for f in sps_files:
-                rows += read_kertas_excel(f.read(), "SPS")
-
+                rows += read_kertas_excel(f.getvalue(), "SPS")
             for f in spt_files:
-                rows += read_kertas_excel(f.read(), "SPT")
+                rows += read_kertas_excel(f.getvalue(), "SPT")
 
             rows = enrich_rows(rows)
 
-            cat1, cat2, cat3, cat4, cat5 = build_categories(
+            cat1, cat2, cat3, cat4, cat5, audit_removed = build_categories(
                 rows=rows,
                 agenda_osc_set=agenda_osc_set,
+                agenda_fallback_pairs=agenda_fallback_pairs,
                 km_start=km_start,
                 km_end=km_end,
                 ut_start=ut_start if ut_enabled else km_start,
                 ut_end=ut_end if ut_enabled else km_end,
                 ut_enabled=ut_enabled,
                 agenda_enabled=agenda_enabled,
+                ptj_exempt_enabled=ptj_exempt_enabled,
             )
 
             doc_bytes = build_word_doc(
@@ -1279,6 +1467,23 @@ if gen:
                     "Kategori 4": len(cat4),
                     "Kategori 5": len(cat5),
                     "Agenda digunakan?": "YA" if agenda_enabled else "TIDAK (Teruskan tanpa Agenda)",
+                    "Agenda: bil No Rujukan OSC dijumpai": len(agenda_osc_set) if agenda_enabled else 0,
+                    "Agenda: bil fallback LOT+PEMOHON (No OSC '-')": len(agenda_fallback_pairs) if agenda_enabled else 0,
+                    "Agenda: dibuang (audit)": len(audit_removed) if agenda_enabled else 0,
                 })
+
+            if agenda_enabled:
+                with st.expander("Audit Tapisan Agenda (yang dibuang)"):
+                    st.caption("Ini untuk Unit OSC semak: kenapa sesuatu permohonan dibuang sebab agenda.")
+                    if not audit_removed:
+                        st.write("Tiada rekod dibuang oleh agenda.")
+                    else:
+                        # show top 50
+                        st.write(audit_removed[:50])
+
+                with st.expander("Debug Agenda (preview extraction)"):
+                    st.caption("Semak parser agenda: list ringkas item yang berjaya diextract.")
+                    st.write(agenda_debug_items[:50])
+
     finally:
         st.session_state.running = False
