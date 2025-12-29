@@ -28,9 +28,6 @@ ALLOWED_SHEETS = {
     "PKM",
     "TKR-GUNA",
     "TKR",
-    "TG",
-    "TUKAR GUNA",
-    "TUKARGUNA",
     "PKM Tukarguna",
     "BGN",
     "BGN EVCB",
@@ -59,6 +56,12 @@ PB_CODES = {"PKM", "TKR-GUNA", "TKR", "124A", "204D", "PS", "SB", "CT"}
 BGN_CODES = {"BGN", "EVCB", "EV", "TELCO"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
+
+# Agenda filter hanya untuk ini
+AGENDA_FILTER_SHEETS = {"SERENTAK", "PKM", "BGN"}
+
+# UT (Kategori 2) hanya untuk ini (termasuk tukar guna variants)
+UT_ALLOWED_BASE = {"SERENTAK", "PKM", "BGN"}
 
 
 # ============================================================
@@ -320,10 +323,6 @@ def extract_codes_and_labels(fail_no: str, sheet_name: str) -> Tuple[Set[str], s
         codes.add("BGN")
         codes.add("EVCB")
 
-    # alias sheet untuk tukar guna
-    if _is_tukar_guna_sheet_name(sheet_name):
-        codes.add("TKR-GUNA")
-
     return codes, label_txt
 
 
@@ -402,38 +401,18 @@ def tindakan_ut(belum_text: str) -> str:
     internal = dedup(internal)
     external = dedup(external)
 
-    tindakan = "\n".join(internal + external).strip()
-    return tindakan
+    return "\n".join(internal + external).strip()
 
 
-def _norm_sheet_name(s: str) -> str:
-    s = (s or "").strip().upper()
-    s = re.sub(r"[\s\-_]+", "", s)
-    return s
-
-
-def _is_tukar_guna_sheet_name(sheet_name: str) -> bool:
-    """
-    Tukar guna boleh muncul sebagai:
-    - TKR-GUNA
-    - TG
-    - TUKAR GUNA
-    - TUKARGUNA
-    - PKM Tukarguna
-    """
-    n = _norm_sheet_name(sheet_name)
-    return n in {"TKRGUNA", "TG", "TUKARGUNA", "PKMTUKARGUNA"}
-
-
-def _is_cat2_allowed_sheet(sheet_name: str) -> bool:
-    """
-    Kategori 2 hanya untuk:
-    SERENTAK, PKM, BGN, TUKAR GUNA (alias2)
-    """
-    up = (sheet_name or "").strip().upper()
-    if up in {"SERENTAK", "PKM", "BGN"}:
+def is_tukar_guna_sheet(sheet_name: str) -> bool:
+    s = (sheet_name or "").strip().upper()
+    if s in {"TKR-GUNA", "TG"}:
         return True
-    return _is_tukar_guna_sheet_name(sheet_name)
+    if "TUKAR" in s and "GUNA" in s:
+        return True
+    if "TKR" in s and "GUNA" in s:
+        return True
+    return False
 
 
 # ============================================================
@@ -513,7 +492,7 @@ def norm_basic(s: str) -> str:
 
 
 def find_header_row(excel_bytes: bytes, sheet: str) -> Tuple[Optional[int], int]:
-    raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=None, engine="openpyxl", nrows=60)
+    raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=None, engine="openpyxl", nrows=70)
     best_idx, best_score = None, 0
     for i in range(len(raw)):
         row = raw.iloc[i].astype(str).fillna("")
@@ -582,6 +561,8 @@ def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
                 "ut_date": parse_date_from_cell(row.get(cols["ut"])) if "ut" in cols else None,
                 "belum": clean_str(row.get(cols["belum"])) if "belum" in cols else "",
                 "keputusan": clean_str(row.get(cols["keputusan"])) if "keputusan" in cols else "",
+                # tambahan untuk logic UT special (PB/PKM)
+                "km_raw": clean_str(row.get(cols["km"])) if "km" in cols else "",
             }
             out.append(rec)
 
@@ -606,22 +587,19 @@ def enrich_rows(rows: List[dict]) -> List[dict]:
     return out
 
 
-def _agenda_filter_applicable(r: dict) -> bool:
+def _km_induk_code_from_raw(km_raw: str) -> str:
     """
-    Tapisan agenda hanya valid untuk SERENTAK / PKM / BGN sahaja.
-    - SERENTAK: r['serentak'] True
-    - PKM: sheet PKM atau ada code PKM
-    - BGN: sheet BGN/BGN EVCB atau ada code BGN
+    Dari cell 'Tempoh Untuk Proses Oleh Jabatan Induk*' kadang hujung ada code (PB/PKM/BGN dll).
+    Contoh: '73 Hari (05/02/2026)\nPB'  -> return 'PB'
     """
-    sheet_up = (r.get("sheet") or "").strip().upper()
-    codes = set(r.get("codes") or set())
-    if r.get("serentak"):
-        return True
-    if sheet_up in {"PKM", "BGN", "BGN EVCB", "SERENTAK"}:
-        return True
-    if ("PKM" in codes) or ("BGN" in codes):
-        return True
-    return False
+    s = (km_raw or "").strip().upper()
+    if not s:
+        return ""
+    # ambil token huruf last
+    tokens = re.findall(r"\b[A-Z]{2,5}\b", s)
+    if not tokens:
+        return ""
+    return tokens[-1].strip()
 
 
 def build_categories(
@@ -635,15 +613,20 @@ def build_categories(
     ut_enabled: bool,
     agenda_enabled: bool,
 ) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
+
     # tapis global keputusan (kalau ada keputusan -> buang terus)
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
-    # tapis agenda (HANYA utk SERENTAK/PKM/BGN)
+    # tapis agenda (HANYA untuk SERENTAK / PKM / BGN)
     if agenda_enabled:
-        def _in_agenda(r: dict) -> bool:
-            return (r["osc_norm"] in agenda_osc_set) or (r["nama_norm"] in agenda_nama_set)
-
-        rows = [r for r in rows if not (_agenda_filter_applicable(r) and _in_agenda(r))]
+        tmp = []
+        for r in rows:
+            sh = (r.get("sheet") or "").strip().upper()
+            if sh in AGENDA_FILTER_SHEETS:
+                if (r["osc_norm"] in agenda_osc_set) or (r["nama_norm"] in agenda_nama_set):
+                    continue
+            tmp.append(r)
+        rows = tmp
 
     # group by fail_induk (untuk handle serentak & dedup)
     by_induk: Dict[str, List[dict]] = {}
@@ -706,52 +689,53 @@ def build_categories(
                     cat1.append(make_rec(1, "Pengarah Bangunan", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-BGN"))
 
         # ----------------------------
-        # KATEGORI 2 — UT (STRICT UPDATE)
-        #
-        # 1) Hanya sheet: SERENTAK, PKM, BGN, TUKAR GUNA (alias)
-        # 2) Keputusan kosong (ditapis awal)
-        # 3) ut_date dalam range UT
-        # 4) Kolum "Belum memberi ulasan" mesti ADA isi sebenar (bukan kosong/dash)
-        #
-        # SERENTAK special strict:
-        # - hanya boleh kalau code serentak TIADA code lain selain {PKM, BGN, 204D, PL}
-        # - wajib ada PKM atau BGN
-        # - jika kolum "Belum..." ada isi -> masuk Kategori 2
+        # KATEGORI 2 — UT (HANYA: SERENTAK, PKM, BGN, TUKAR GUNA)
+        # RULE:
+        # - ut_date dalam range UT
+        # - kolum "Belum memberi ulasan" mesti ADA isi sebenar (bukan kosong / '-' / '—')
+        # - keputusan mesti kosong (dah ditapis awal)
+        # - SERENTAK: strict (PKM+BGN) dan relate (204D/PL) dan tak campur kod lain
         # ----------------------------
         if ut_enabled:
             if is_ser:
-                # Serentak: validate codes allowed
-                allowed_ser = {"PKM", "BGN", "204D", "PL"}
-                if not (union_codes & {"PKM", "BGN"}):
-                    pass  # tak layak cat2 serentak
-                elif (union_codes - allowed_ser):
-                    pass  # ada code lain -> reject terus cat2
+                # ambil 1 rekod utama (prefer sheet SERENTAK)
+                g0 = None
+                for x in grp:
+                    if (x.get("sheet") or "").strip().upper() == "SERENTAK":
+                        g0 = x
+                        break
+                if g0 is None:
+                    g0 = grp[0]
+
+                if not in_range(g0.get("ut_date"), ut_start, ut_end):
+                    pass
                 else:
-                    for g in grp:
-                        if not _is_cat2_allowed_sheet(g.get("sheet", "")):
-                            continue
-                        if not in_range(g.get("ut_date"), ut_start, ut_end):
-                            continue
-                        if is_blankish_text(g.get("belum")):
-                            continue
+                    # mesti ada isi "belum"
+                    if not is_blankish_text(g0.get("belum")):
+                        # strict: mesti PKM+BGN, dan ada 204D atau PL, dan tiada kod lain
+                        allowed_ser_ut = {"PKM", "BGN", "204D", "PL"}
+                        cond_pkm_bgn = {"PKM", "BGN"}.issubset(union_codes)
+                        cond_204d_pl = ("204D" in union_codes) or ("PL" in union_codes)
+                        cond_no_other = (union_codes - allowed_ser_ut) == set()
 
-                        tindakan = tindakan_ut(g.get("belum", ""))
-                        if is_blankish_text(tindakan):
-                            continue
-
-                        perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {g['ut_date'].strftime('%d.%m.%Y')}."
-                        jenis = jenis_ser + (f" {g['label']}" if g["label"] else "")
-                        fail_no = fail_no_ser
-
-                        extra_key = f"SER|{tindakan}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
-                        cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, extra_key))
+                        if cond_pkm_bgn and cond_204d_pl and cond_no_other:
+                            tindakan = tindakan_ut(g0.get("belum", ""))
+                            if not is_blankish_text(tindakan):
+                                perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {g0['ut_date'].strftime('%d.%m.%Y')}."
+                                extra_key = f"{tindakan}|{g0['ut_date'].isoformat()}|{(g0.get('belum') or '').strip()}|SERENTAK-STRICT"
+                                cat2.append(make_rec(2, tindakan, g0, jenis_ser, fail_no_ser, perkara, extra_key))
             else:
-                # Non-serentak: hanya PKM/BGN/TUKAR GUNA
                 for g in grp:
-                    if not _is_cat2_allowed_sheet(g.get("sheet", "")):
+                    sh = (g.get("sheet") or "").strip()
+                    sh_up = sh.upper()
+
+                    # UT allowed sheets
+                    if (sh_up not in UT_ALLOWED_BASE) and (not is_tukar_guna_sheet(sh_up)):
                         continue
+
                     if not in_range(g.get("ut_date"), ut_start, ut_end):
                         continue
+
                     if is_blankish_text(g.get("belum")):
                         continue
 
@@ -763,7 +747,7 @@ def build_categories(
                     jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     fail_no = g["fail_no_raw"]
 
-                    extra_key = f"NS|{tindakan}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
+                    extra_key = f"{tindakan}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}|{sh_up}"
                     cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, extra_key))
 
         # ----------------------------
@@ -817,9 +801,19 @@ def build_categories(
 
 # ============================================================
 # WORD FORMATTER
+# Fix header wrap: BIL & DAERAH
 # ============================================================
-# Fix header wrap issue (BIL & DAERAH)
-COL_WIDTHS_IN = [0.45, 1.75, 1.6, 1.6, 1.6, 0.75, 0.65, 0.75, 1.65]
+COL_WIDTHS_IN = [
+    0.45,  # BIL (besar sikit supaya tak pecah)
+    1.80,  # TINDAKAN
+    1.60,  # JENIS
+    1.60,  # FAIL NO
+    1.60,  # PEMAJU/PEMOHON
+    0.75,  # DAERAH (besar sikit supaya tak pecah)
+    0.55,  # MUKIM (kecil sikit compensate)
+    0.65,  # LOT (kecil sikit compensate)
+    1.85,  # PERKARA (kecil sikit compensate)
+]
 HEADERS = ["BIL", "TINDAKAN", "JENIS\nPERMOHONAN", "FAIL NO", "PEMAJU/PEMOHON", "DAERAH", "MUKIM", "LOT", "PERKARA"]
 
 
@@ -839,31 +833,26 @@ def get_font(size_pt: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def make_g_logo_png(diameter_px: int = 160, outline_px: int = 6, font_pt: int = 22, supersample: int = 4) -> bytes:
+def make_g_logo_png(diameter_px: int = 140, outline_px: int = 4, font_pt: int = 30) -> bytes:
     """
-    Logo G lebih smooth (anti-alias) supaya circle nampak cantik.
-    - diameter_px: size final
-    - outline_px: ketebalan circle (final)
-    - font_pt: ikut requirement (Times New Roman Bold 22)
+    Logo:
+    - Circle line kekal (outline_px)
+    - Diameter dibesarkan
+    - Huruf G dibesarkan (font_pt)
     """
-    big = diameter_px * supersample
-    big_outline = outline_px * supersample
+    img = Image.new("RGBA", (diameter_px, diameter_px), (255, 255, 255, 0))
+    dr = ImageDraw.Draw(img)
 
-    img_big = Image.new("RGBA", (big, big), (255, 255, 255, 0))
-    dr = ImageDraw.Draw(img_big)
+    pad = outline_px + 4
+    dr.ellipse((pad, pad, diameter_px - pad, diameter_px - pad), outline=(0, 0, 0, 255), width=outline_px)
 
-    pad = big_outline + (6 * supersample)
-    dr.ellipse((pad, pad, big - pad, big - pad), outline=(0, 0, 0, 255), width=big_outline)
-
-    font = get_font(font_pt * supersample)
+    font = get_font(font_pt)
     text = "G"
     bbox = dr.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x = (big - tw) / 2 - bbox[0]
-    y = (big - th) / 2 - bbox[1]
+    x = (diameter_px - tw) / 2 - bbox[0]
+    y = (diameter_px - th) / 2 - bbox[1]
     dr.text((x, y), text, font=font, fill=(0, 0, 0, 255))
-
-    img = img_big.resize((diameter_px, diameter_px), resample=Image.Resampling.LANCZOS)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -899,8 +888,8 @@ def add_logo_first_page(sec, logo_png_bytes: bytes):
     p = hdr.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     run = p.add_run()
-    # Besarkan sedikit supaya lebih sama macam contoh colleague
-    run.add_picture(io.BytesIO(logo_png_bytes), width=Inches(0.75))
+    # Besarkan saiz logo dalam header
+    run.add_picture(io.BytesIO(logo_png_bytes), width=Inches(0.78))
 
 
 def set_paragraph_font(p, font_name: str, size_pt: float, bold: bool = False, align=None):
@@ -1195,7 +1184,7 @@ with right_col:
         proceed_without_agenda = st.checkbox(
             "Teruskan tanpa Agenda",
             value=False,
-            help="Tick jika agenda belum diterima. Sistem akan jana tanpa tapisan agenda.",
+            help="Tick jika agenda belum diterima. Sistem akan jana tanpa tapisan agenda."
         )
 
         st.markdown("**Kertas Maklumat (Excel) — SPU/SPS/SPT (boleh upload 1 atau 2 fail setiap daerah)**")
