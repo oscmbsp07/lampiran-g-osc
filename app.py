@@ -45,6 +45,20 @@ ALLOWED_SHEETS = {
     "LJUP",
 }
 
+# Tapisan agenda TERHAD (ikut arahan terbaru user)
+# NOTE: EV termasuk dalam cluster EVCB (kadang kertas maklumat guna "EV" sahaja).
+AGENDA_FILTER_SHEETS = {
+    "SERENTAK",
+    "PKM",
+    "TKR-GUNA",        # termasuk variasi "TG" melalui canonical mapping
+    "PKM TUKARGUNA",
+    "BGN",
+    "TELCO",
+    "EVCB",
+    "BGN EVCB",
+    "EV",
+}
+
 DAERAH_ORDER = {"SPU": 0, "SPS": 1, "SPT": 2}
 
 KNOWN_CODES = [
@@ -54,15 +68,11 @@ KNOWN_CODES = [
 ]
 
 PB_CODES = {"PKM", "TKR-GUNA", "TKR", "124A", "204D", "PS", "SB", "CT"}
-BGN_CODES = {"BGN", "EVCB", "EV", "TELCO", "BGN EVCB"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
 
-# Tapisan agenda: kini dibenarkan untuk SEMUA allowed sheets.
-# PTJ tak akan dibuang kerana PTJ tidak dimasukkan dalam index agenda.
-AGENDA_FILTER_SHEETS = set(ALLOWED_SHEETS)
-
-UT_ALLOWED_SHEETS = {"SERENTAK", "PKM", "BGN", "BGN EVCB", "TKR-GUNA", "PKM TUKARGUNA", "TKR", "PKM TUKARGUNA"}
+# UT rules kekal (boleh refine kemudian jika perlu)
+UT_ALLOWED_SHEETS = {"SERENTAK", "PKM", "BGN", "BGN EVCB", "TKR-GUNA", "PKM TUKARGUNA", "TKR"}
 SERENTAK_UT_ALLOWED_INDUK = {"PB", "PKM", "BGN"}
 
 
@@ -267,21 +277,45 @@ def normalize_osc_prefix(s: str) -> str:
     return s2.upper()
 
 
+def sheet_norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).upper()
+
+
+def canonical_sheet_name(sheet: str) -> str:
+    """
+    Canonicalize variasi nama sheet dalam excel supaya:
+    - "TG" dianggap "TKR-GUNA"
+    - "TKR GUNA" dianggap "TKR-GUNA"
+    - "PKM TUKAR GUNA" dianggap "PKM TUKARGUNA"
+    - "BGN-EVCB" dianggap "BGN EVCB"
+    - "E V" (jika ada spacing pelik) jadi "EV"
+    """
+    s = sheet_norm(sheet)
+    s = s.replace("_", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    if s in {"E V"}:
+        return "EV"
+
+    if s in {"TG", "TUKARGUNA", "TUKAR GUNA"}:
+        return "TKR-GUNA"
+    if s in {"TKR GUNA", "TKR-GUNA"}:
+        return "TKR-GUNA"
+    if s in {"PKM TUKAR GUNA", "PKM TUKARGUNA"}:
+        return "PKM TUKARGUNA"
+    if s in {"BGN-EVCB", "BGN EVCB"}:
+        return "BGN EVCB"
+
+    return s
+
+
 def extract_tail_only(fail_no: str) -> str:
-    """
-    NO UNIK HUJUNG (tail) — inilah matching utama.
-    Contoh: MBSP/15/T49-2511/1480-BGN(TCO) -> 1480
-    """
     s = normalize_osc_prefix(fail_no)
     m = re.search(r"/(\d{3,5})(?:[-A-Z\(]|$)", s)
     return m.group(1) if m else ""
 
 
 def extract_series_tail_key(fail_no: str) -> str:
-    """
-    Backup key (kalau perlu): series|tail
-    Contoh -> T49-2511|1480
-    """
     s = normalize_osc_prefix(fail_no)
     m = re.search(r"^MBSP/\d+/([^/]+)/(\d{3,5})", s)
     if not m:
@@ -290,10 +324,6 @@ def extract_series_tail_key(fail_no: str) -> str:
 
 
 def extract_osc_head(fail_no: str) -> str:
-    """
-    Canonical head: MBSP/<tahun>/<series>/<tail>
-    (ignore suffix -BGN(TCO) dsb)
-    """
     s = normalize_osc_prefix(fail_no)
     m = re.search(r"^(MBSP)/(\d+)/([^/]+)/(\d{3,5})", s)
     if not m:
@@ -322,25 +352,18 @@ def keputusan_is_empty(v) -> bool:
     return False
 
 
-def sheet_norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip()).upper()
-
-
 def is_serentak(sheet_name: str, fail_no: str) -> bool:
-    if sheet_norm(sheet_name) == "SERENTAK":
+    if canonical_sheet_name(sheet_name) == "SERENTAK":
         return True
     return "SERENTAK" in str(fail_no or "").upper()
 
 
 def _sheet_implied_codes(sheet_u: str) -> Set[str]:
-    """
-    Tangani variasi sheet seperti 'PKM TUKARGUNA' dengan lebih bijak.
-    """
     s = sheet_u.upper()
     out = set()
     if "PKM" in s:
         out.add("PKM")
-    if "TKR-GUNA" in s or ("TKR" in s and "GUNA" in s):
+    if "TKR-GUNA" in s or s == "TKR GUNA" or s == "TG":
         out.add("TKR-GUNA")
     elif re.fullmatch(r"TKR", s):
         out.add("TKR")
@@ -377,10 +400,10 @@ def extract_codes(fail_no: str, sheet_name: str) -> Set[str]:
         if t in KNOWN_CODES:
             codes.add(t)
 
-    sn = sheet_norm(sheet_name)
+    sn = canonical_sheet_name(sheet_name)
     codes |= _sheet_implied_codes(sn)
-    # Special sheet BGN EVCB
-    if sn in {"BGN EVCB", "BGN-EVCB"}:
+
+    if sn in {"BGN EVCB"}:
         codes.add("BGN")
         codes.add("EVCB")
     return codes
@@ -474,9 +497,9 @@ def lot_tokens(x: str) -> Set[str]:
 class AgendaBlock:
     is_ptj: bool
     codes: Set[str]
-    osc_heads: List[str]            # MBSP/yy/series/tail
-    tails: Set[str]                 # {"1480", ...}
-    series_tail_keys: Set[str]      # {"T49-2511|1480", ...}
+    osc_heads: List[str]
+    tails: Set[str]
+    series_tail_keys: Set[str]
     pemohon_key: str
     lot_set: Set[str]
     has_osc: bool
@@ -484,17 +507,15 @@ class AgendaBlock:
 
 @dataclass
 class AgendaIndex:
-    tails_all: Set[str]             # semua tail dari agenda (NON-PTJ)
-    series_tail_all: Set[str]       # semua series|tail dari agenda (NON-PTJ)
-    osc_head_norm_all: Set[str]     # normalized head utk backup
-    blocks: List[AgendaBlock]       # untuk fallback pemohon+lot
+    tails_all: Set[str]
+    series_tail_all: Set[str]
+    osc_head_norm_all: Set[str]
+    blocks: List[AgendaBlock]
 
 
-# Header boleh ada numbering "6.8 KERTAS MESYUARAT..."
 HEADER_ANYWHERE_RE = re.compile(r"(?i)\bKERTAS\s+MESYUARAT\s+BIL\.\s*OSC/")
-HEADER_CODE_RE = re.compile(r"(?i)OSC/([A-Z]{2,10}(?:-[A-Z]{2,10})?)/")
+HEADER_CODE_RE = re.compile(r"(?i)OSC/([A-Z]{2,12}(?:-[A-Z]{2,12})?)/")
 
-# Tangkap OSC head sampai tail sahaja (suffix tak penting utk match)
 OSC_HEAD_RE = re.compile(
     r"(?i)\b(MBSP|MBPS|MPSP)\s*/\s*(\d+)\s*/\s*([A-Z0-9\-]+)\s*/\s*(\d{3,5})\b"
 )
@@ -602,7 +623,6 @@ def _parse_agenda_block(block_text: str) -> AgendaBlock:
     series_tail_keys: Set[str] = set()
     has_osc = False
 
-    # (A) from OSC head patterns anywhere in block
     for m in OSC_HEAD_RE.finditer(block_text):
         prefix = normalize_osc_prefix(m.group(1))
         yy = m.group(2)
@@ -611,11 +631,9 @@ def _parse_agenda_block(block_text: str) -> AgendaBlock:
         head = f"{prefix}/{yy}/{series}/{tail}"
         osc_heads.append(head)
         tails.add(tail)
-        k = f"{series}|{tail}"
-        series_tail_keys.add(k)
+        series_tail_keys.add(f"{series}|{tail}")
         has_osc = True
 
-    # (B) from "No. Rujukan OSC : ..." line (if any)
     for m in NO_RUJ_OSC_LINE_RE.finditer(block_text):
         rhs = (m.group(1) or "").strip()
         if not rhs:
@@ -635,7 +653,6 @@ def _parse_agenda_block(block_text: str) -> AgendaBlock:
             series_tail_keys.add(f"{series}|{tail}")
             has_osc = True
 
-    # de-dup osc_heads
     seen = set()
     osc_heads2 = []
     for x in osc_heads:
@@ -644,7 +661,6 @@ def _parse_agenda_block(block_text: str) -> AgendaBlock:
             osc_heads2.append(x)
     osc_heads = osc_heads2
 
-    # pemohon
     pem = ""
     m = PEMOHON_LINE_RE.search(block_text)
     if m:
@@ -655,7 +671,6 @@ def _parse_agenda_block(block_text: str) -> AgendaBlock:
             pem = (m2.group(1) or "").strip()
     pem_key = pemohon_norm(pem)
 
-    # lot tokens (digits around "Lot"/PT")
     lot_candidates = []
     for mm in re.finditer(r"(?i)\b(?:di\s+atas\s+)?lot\b[^.\n\r]{0,160}", block_text):
         lot_candidates.append(mm.group(0))
@@ -698,7 +713,6 @@ def parse_agenda_docx(file_bytes: bytes, enable_ocr: bool = False) -> AgendaInde
         blk = _parse_agenda_block(blk_text)
         blocks.append(blk)
 
-        # PTJ: jangan masukkan dalam index buang
         if blk.is_ptj:
             continue
 
@@ -790,7 +804,9 @@ def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
     allowed_upper = {s.upper() for s in ALLOWED_SHEETS}
 
     for sheet in xl.sheet_names:
-        sheet_clean = (sheet or "").strip()
+        sheet_clean_raw = (sheet or "").strip()
+        sheet_clean = canonical_sheet_name(sheet_clean_raw)
+
         if sheet_clean.upper() not in allowed_upper:
             continue
 
@@ -814,7 +830,6 @@ def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
                 continue
 
             km_raw = row.get(cols["km"]) if "km" in cols else None
-
             fail_raw = normalize_osc_prefix(clean_fail_no(fail))
 
             rec = {
@@ -841,14 +856,12 @@ def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
 def enrich_rows(rows: List[dict]) -> List[dict]:
     out = []
     for r in rows:
-        codes = extract_codes(r["fail_no_raw"], r["sheet"])
         rr = dict(r)
-        rr["codes"] = codes
-        rr["serentak"] = is_serentak(r["sheet"], r["fail_no_raw"])
+        rr["sheet_u"] = canonical_sheet_name(r["sheet"])
+        rr["codes"] = extract_codes(r["fail_no_raw"], rr["sheet_u"])
+        rr["serentak"] = is_serentak(rr["sheet_u"], r["fail_no_raw"])
         rr["fail_induk"] = split_fail_induk(r["fail_no_raw"])
-        rr["sheet_u"] = sheet_norm(r["sheet"])
 
-        # agenda matching keys
         rr["tail"] = extract_tail_only(r["fail_no_raw"])
         rr["series_tail"] = extract_series_tail_key(r["fail_no_raw"])
         rr["osc_head_norm"] = osc_norm(extract_osc_head(r["fail_no_raw"]))
@@ -860,19 +873,15 @@ def enrich_rows(rows: List[dict]) -> List[dict]:
 
 
 def sheet_is_ut_allowed(sheet_u: str) -> bool:
-    if sheet_u in UT_ALLOWED_SHEETS:
+    s = canonical_sheet_name(sheet_u)
+    if s in UT_ALLOWED_SHEETS:
         return True
-    # handle variasi tukar guna
-    if "GUNA" in sheet_u and ("TKR" in sheet_u or "TUKAR" in sheet_u):
+    if "GUNA" in s and ("TKR" in s or "TUKAR" in s or s == "TG"):
         return True
     return False
 
 
-def _agenda_fallback_match(row: dict, agenda: AgendaIndex) -> bool:
-    """
-    Fallback pemohon+lot bila agenda tiada No OSC / '-' / mismatch.
-    STRICT: require pemohon sama + overlap lot munasabah.
-    """
+def _agenda_fallback_match(row: dict, agenda: "AgendaIndex") -> bool:
     if row["sheet_u"] not in AGENDA_FILTER_SHEETS:
         return False
     if not row.get("pemohon_key"):
@@ -888,7 +897,6 @@ def _agenda_fallback_match(row: dict, agenda: AgendaIndex) -> bool:
         if not blk.pemohon_key or not blk.lot_set:
             continue
 
-        # kalau header code ada, mesti overlap untuk kurangkan false remove
         if blk.codes and not (row_codes & blk.codes):
             continue
 
@@ -899,7 +907,6 @@ def _agenda_fallback_match(row: dict, agenda: AgendaIndex) -> bool:
         if not inter:
             continue
 
-        # jika kedua2 ada 2+ token lot, require at least 2 overlap
         if min(len(row["lot_set"]), len(blk.lot_set)) >= 2 and len(inter) < 2:
             continue
 
@@ -910,7 +917,7 @@ def _agenda_fallback_match(row: dict, agenda: AgendaIndex) -> bool:
 
 def build_categories(
     rows: List[dict],
-    agenda: Optional[AgendaIndex],
+    agenda: Optional["AgendaIndex"],
     km_start: dt.date,
     km_end: dt.date,
     ut_start: dt.date,
@@ -919,28 +926,22 @@ def build_categories(
     agenda_enabled: bool,
 ) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
 
-    # 1) Buang yang ada keputusan
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
-    # 2) Tapisan agenda (TAIL-BASED = NO UNIK HUJUNG)
     if agenda_enabled and agenda:
         def _keep(r: dict) -> bool:
             if r["sheet_u"] not in AGENDA_FILTER_SHEETS:
                 return True
 
-            # (A) MAIN RULE: tail match => buang (NON-PTJ sahaja sebab index exclude PTJ)
             if r.get("tail") and r["tail"] in agenda.tails_all:
                 return False
 
-            # (B) backup series|tail
             if r.get("series_tail") and r["series_tail"] in agenda.series_tail_all:
                 return False
 
-            # (C) backup osc head norm
             if r.get("osc_head_norm") and r["osc_head_norm"] in agenda.osc_head_norm_all:
                 return False
 
-            # (D) fallback pemohon+lot untuk kes agenda tiada No OSC
             if _agenda_fallback_match(r, agenda):
                 return False
 
@@ -948,7 +949,6 @@ def build_categories(
 
         rows = [r for r in rows if _keep(r)]
 
-    # group by fail_induk (handle serentak & dedup)
     by_induk: Dict[str, List[dict]] = {}
     for r in rows:
         by_induk.setdefault(r["fail_induk"], []).append(r)
@@ -986,9 +986,7 @@ def build_categories(
         jenis_ser = (f"{codes_join} (Serentak)".strip() if codes_join else "(Serentak)").strip()
         fail_no_ser = f"{induk}-{codes_join}" if codes_join else induk
 
-        # ----------------------------
-        # KATEGORI 1 — KM (PB/BGN)
-        # ----------------------------
+        # KATEGORI 1 — KM
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & (PB_CODES - {"PS", "SB", "CT"}):
                 cat1.append(make_rec(1, "Pengarah Perancang Bandar", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-PB"))
@@ -1004,9 +1002,7 @@ def build_categories(
                 if g["codes"] & {"BGN", "EVCB", "EV", "TELCO"}:
                     cat1.append(make_rec(1, "Pengarah Bangunan", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-BGN"))
 
-        # ----------------------------
-        # KATEGORI 2 — UT (TERHAD)
-        # ----------------------------
+        # KATEGORI 2 — UT
         if ut_enabled:
             for g in grp:
                 if not sheet_is_ut_allowed(g["sheet_u"]):
@@ -1031,9 +1027,7 @@ def build_categories(
                 extra_key = f"{g['sheet_u']}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
                 cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, extra_key))
 
-        # ----------------------------
         # KATEGORI 3/4/5 — KM
-        # ----------------------------
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & KEJ_CODES:
                 cat3.append(make_rec(3, "Pengarah Kejuruteraan", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-KEJ"))
@@ -1487,7 +1481,6 @@ if gen:
                 ut_start = None
                 ut_end = None
 
-            # Validasi Agenda
             agenda_enabled = True
             if proceed_without_agenda:
                 agenda_enabled = False
@@ -1496,7 +1489,6 @@ if gen:
                     st.error("Sila upload Agenda JK OSC (.docx) atau tick 'Teruskan tanpa Agenda'.")
                     st.stop()
 
-            # Validasi kertas maklumat (multi upload)
             spu_files = spu_files or []
             sps_files = sps_files or []
             spt_files = spt_files or []
@@ -1509,7 +1501,6 @@ if gen:
                 st.error("Maksimum 2 fail dibenarkan bagi setiap daerah (SPU/SPS/SPT).")
                 st.stop()
 
-            # Validasi tarikh KM/UT
             if km_start is None or km_end is None:
                 st.error("Sila isi tarikh KM Mula dan KM Akhir dalam format dd/mm/yyyy.")
                 st.stop()
@@ -1525,19 +1516,16 @@ if gen:
                     st.error("UT Mula tidak boleh lebih besar daripada UT Akhir.")
                     st.stop()
 
-            # Read agenda
             agenda_index = None
             if agenda_enabled:
                 agenda_bytes = agenda_file.read()
                 agenda_index = parse_agenda_docx(agenda_bytes, enable_ocr=enable_agenda_ocr)
-
                 if enable_agenda_ocr:
                     try:
                         import pytesseract  # type: ignore
                     except Exception:
                         st.warning("OCR tidak tersedia pada server ini. Sistem teruskan baca agenda tanpa OCR (text sahaja).")
 
-            # Read excel files
             rows: List[dict] = []
             for f in spu_files:
                 rows += read_kertas_excel(f.read(), "SPU")
@@ -1590,6 +1578,7 @@ if gen:
                     "Kategori 5": len(cat5),
                     "Agenda digunakan?": "YA" if agenda_enabled else "TIDAK (Teruskan tanpa Agenda)",
                     "OCR agenda aktif?": "YA" if (agenda_enabled and enable_agenda_ocr) else "TIDAK",
+                    "Sheet ditapis agenda": sorted(list(AGENDA_FILTER_SHEETS)),
                     "Rule tapisan agenda": "TAIL-BASED (No Unik Hujung) — PTJ dikecualikan",
                 })
     finally:
