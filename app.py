@@ -3,14 +3,13 @@ import math
 import os
 import re
 import base64
-import time
 import datetime as dt
 from typing import Dict, List, Optional, Tuple, Set
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageFont
+import streamlit.components.v1 as components
 
 from docx import Document
 from docx.enum.section import WD_ORIENTATION, WD_SECTION
@@ -59,9 +58,88 @@ BGN_CODES = {"BGN", "EVCB", "EV", "TELCO"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
 
-# Audio paths (letak file mp3 dalam folder ini)
-INTRO_AUDIO_PATH = "assets/audio/Selamat Datang OSC.mp3"
-GENERATING_AUDIO_PATH = "assets/audio/Lampiran G sedang dijana.mp3"
+
+# ============================================================
+# AUDIO HELPERS (AUTO INTRO + PLAY ON GENERATE)
+# ============================================================
+def _try_read_file_bytes(path: str) -> Optional[bytes]:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def load_audio_bytes(candidate_paths: List[str]) -> Optional[bytes]:
+    for p in candidate_paths:
+        b = _try_read_file_bytes(p)
+        if b:
+            return b
+    return None
+
+
+def _audio_html_autoplay(audio_bytes: bytes, element_id: str, also_bind_first_gesture: bool = True) -> str:
+    """
+    Autoplay audio using <audio>. Browser may block autoplay; optional fallback
+    will bind first click/keydown to play once.
+    """
+    b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    # audio/mpeg works for mp3
+    html = f"""
+    <audio id="{element_id}" style="display:none" preload="auto">
+      <source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg">
+    </audio>
+    <script>
+      (function() {{
+        const a = document.getElementById("{element_id}");
+        if (!a) return;
+
+        async function tryPlay() {{
+          try {{
+            a.currentTime = 0;
+            await a.play();
+          }} catch (e) {{
+            // autoplay blocked - ignore
+          }}
+        }}
+
+        // Try immediately
+        tryPlay();
+
+        {""
+        if not also_bind_first_gesture else
+        f"""
+        // Bind play on first user gesture (more reliable on Chrome/Edge)
+        if (!window.__oscAudioBound_{element_id}) {{
+          window.__oscAudioBound_{element_id} = true;
+          let played = false;
+
+          function onGesture() {{
+            if (played) return;
+            played = true;
+            tryPlay();
+            window.removeEventListener('click', onGesture, true);
+            window.removeEventListener('keydown', onGesture, true);
+          }}
+
+          window.addEventListener('click', onGesture, true);
+          window.addEventListener('keydown', onGesture, true);
+        }}
+        """}
+      }})();
+    </script>
+    """
+    return html
+
+
+def play_audio_component(audio_bytes: Optional[bytes], key: str, element_id: str, bind_first_gesture: bool = True):
+    """
+    Render hidden autoplay audio via components.html. key MUST be string.
+    """
+    if not audio_bytes:
+        return
+    html = _audio_html_autoplay(audio_bytes, element_id=element_id, also_bind_first_gesture=bind_first_gesture)
+    components.html(html, height=0, key=str(key))
 
 
 # ============================================================
@@ -194,48 +272,6 @@ def _parse_ddmmyyyy(s: str) -> Optional[dt.date]:
         return dt.datetime.strptime(s, "%d/%m/%Y").date()
     except Exception:
         return None
-
-
-# ============================================================
-# AUDIO (AUTO, TANPA CHECKBOX)
-# ============================================================
-def _load_audio_bytes(path: str) -> Optional[bytes]:
-    try:
-        if not path or not os.path.exists(path):
-            return None
-        with open(path, "rb") as f:
-            return f.read()
-    except Exception:
-        return None
-
-
-def _play_audio_autoplay(audio_bytes: Optional[bytes], key: str, volume: float = 1.0):
-    """
-    Cuba autoplay audio melalui HTML <audio autoplay>.
-    Nota: Sesetengah browser block autoplay pada page-load.
-    Untuk event klik (JANA), biasanya lepas.
-    """
-    if not audio_bytes:
-        return
-
-    b64 = base64.b64encode(audio_bytes).decode("utf-8")
-    vol = max(0.0, min(1.0, float(volume)))
-
-    html = f"""
-    <audio id="a" autoplay>
-      <source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg">
-    </audio>
-    <script>
-      const a = document.getElementById("a");
-      if (a) {{
-        a.volume = {vol};
-        a.play().catch(() => {{
-          // autoplay mungkin diblock oleh browser; biar saja, jangan crash app
-        }});
-      }}
-    </script>
-    """
-    components.html(html, height=0, width=0, key=key)
 
 
 # ============================================================
@@ -443,8 +479,7 @@ def tindakan_ut(belum_text: str) -> str:
     internal = dedup(internal)
     external = dedup(external)
 
-    tindakan = "\n".join(internal + external).strip()
-    return tindakan
+    return "\n".join(internal + external).strip()
 
 
 # ============================================================
@@ -510,12 +545,7 @@ COL_CANDIDATES = {
     "lot": ["lot"],
     "km": ["tempohuntukprosesolehjabataninduk", "tempohuntukproses"],
     "ut": ["tempohuntukdiberiulasanolehjabatanteknikal", "tempohuntukdiberiulasan"],
-    "belum": [
-        "jabatanindukteknikalygbelummemberikeputusanulasansehinggakini",
-        "belummemberikeputusanulasan",
-        "ygbelummemberikeputusan",
-        "belummemberi",
-    ],
+    "belum": ["jabatanindukteknikalygbelummemberikeputusanulasansehinggakini", "belummemberikeputusanulasan", "ygbelummemberikeputusan", "belummemberi"],
     "keputusan": ["tarikhkeputusankuasa", "tarikhkeputusan"],
 }
 
@@ -713,7 +743,7 @@ def build_categories(
                     continue
 
                 if is_blankish_text(g.get("belum")):
-                    continue  # kosong / '-' -> tak masuk
+                    continue  # kosong -> tak masuk
 
                 tindakan = tindakan_ut(g.get("belum", ""))
                 if is_blankish_text(tindakan):
@@ -1096,28 +1126,32 @@ bg_ok = _inject_bg_and_css("assets/bg.jpg")
 if not bg_ok:
     st.warning("Background tidak dijumpai. Pastikan fail ada di folder assets/ (contoh: assets/bg.jpg).")
 
+# load audio files (server-side)
+INTRO_AUDIO = load_audio_bytes([
+    "assets/Selamat Datang OSC.mp3",
+    "assets/selamat_datang_osc.mp3",
+    "Selamat Datang OSC.mp3",
+    "selamat_datang_osc.mp3",
+])
+
+GEN_AUDIO = load_audio_bytes([
+    "assets/Lampiran G sedang dijana.mp3",
+    "assets/lampiran_g_sedang_dijana.mp3",
+    "Lampiran G sedang dijana.mp3",
+    "lampiran_g_sedang_dijana.mp3",
+])
+
+# autoplay intro: try now + fallback on first click/keypress
+# NOTE: browser may block true autoplay; fallback ensures it plays after first user interaction.
+play_audio_component(INTRO_AUDIO, key="intro_audio_once", element_id="intro_audio", bind_first_gesture=True)
+
 st.markdown("<h1 class='app-title'>LAMPIRAN G UNIT OSC</h1>", unsafe_allow_html=True)
 st.markdown("<div class='hero-spacer'></div>", unsafe_allow_html=True)
 
-# session state init
 if "running" not in st.session_state:
     st.session_state.running = False
-if "intro_played" not in st.session_state:
-    st.session_state.intro_played = False
-if "audio_counter" not in st.session_state:
-    st.session_state.audio_counter = 0
-
-# Load audio bytes (sekali)
-if "intro_audio_bytes" not in st.session_state:
-    st.session_state.intro_audio_bytes = _load_audio_bytes(INTRO_AUDIO_PATH)
-if "gen_audio_bytes" not in st.session_state:
-    st.session_state.gen_audio_bytes = _load_audio_bytes(GENERATING_AUDIO_PATH)
-
-# Auto play intro (sekali sahaja per session)
-if not st.session_state.intro_played:
-    st.session_state.audio_counter += 1
-    _play_audio_autoplay(st.session_state.intro_audio_bytes, key=f"intro_audio_{st.session_state.audio_counter}", volume=1.0)
-    st.session_state.intro_played = True
+if "gen_audio_counter" not in st.session_state:
+    st.session_state.gen_audio_counter = 0
 
 left_col, right_col = st.columns([1.15, 0.85], gap="large")
 
@@ -1166,13 +1200,13 @@ with right_col:
         st.caption("Nota: Hujung/awal tahun boleh jadi 2 fail (tahun lama + tahun baru). Sistem akan gabungkan.")
 
         st.markdown("**SPU (maks 2 fail)**")
-        spu_files = st.file_uploader("", type=["xlsx", "xlsm", "xls"], key="spu_multi", label_visibility="collapsed", accept_multiple_files=True)
+        spu_files = st.file_uploader("", type=["xlsx", "xlsm"], key="spu_multi", label_visibility="collapsed", accept_multiple_files=True)
 
         st.markdown("**SPS (maks 2 fail)**")
-        sps_files = st.file_uploader("", type=["xlsx", "xlsm", "xls"], key="sps_multi", label_visibility="collapsed", accept_multiple_files=True)
+        sps_files = st.file_uploader("", type=["xlsx", "xlsm"], key="sps_multi", label_visibility="collapsed", accept_multiple_files=True)
 
         st.markdown("**SPT (maks 2 fail)**")
-        spt_files = st.file_uploader("", type=["xlsx", "xlsm", "xls"], key="spt_multi", label_visibility="collapsed", accept_multiple_files=True)
+        spt_files = st.file_uploader("", type=["xlsx", "xlsm"], key="spt_multi", label_visibility="collapsed", accept_multiple_files=True)
 
 mid = st.columns([1, 0.55, 1])[1]
 with mid:
@@ -1185,12 +1219,14 @@ with mid:
 if gen:
     st.session_state.running = True
     try:
-        # Play generating audio (auto, setiap kali generate)
-        st.session_state.audio_counter += 1
-        _play_audio_autoplay(st.session_state.gen_audio_bytes, key=f"gen_audio_{st.session_state.audio_counter}", volume=1.0)
-
-        # bagi peluang delta UI/audio “flush”
-        time.sleep(0.05)
+        # PLAY "sedang jana" audio immediately on button press (user gesture)
+        st.session_state.gen_audio_counter += 1
+        play_audio_component(
+            GEN_AUDIO,
+            key=f"gen_audio_{st.session_state.gen_audio_counter}",
+            element_id=f"gen_audio_el_{st.session_state.gen_audio_counter}",
+            bind_first_gesture=False,  # user already clicked button
+        )
 
         with st.spinner("Sedang jana Lampiran G... Sila tunggu."):
             km_start = _parse_ddmmyyyy(km_mula_str)
@@ -1204,10 +1240,13 @@ if gen:
                 ut_end = None
 
             # Validasi Agenda
-            agenda_enabled = not proceed_without_agenda
-            if agenda_enabled and not agenda_file:
-                st.error("Sila upload Agenda JK OSC (.docx) atau tick 'Teruskan tanpa Agenda'.")
-                st.stop()
+            agenda_enabled = True
+            if proceed_without_agenda:
+                agenda_enabled = False
+            else:
+                if not agenda_file:
+                    st.error("Sila upload Agenda JK OSC (.docx) atau tick 'Teruskan tanpa Agenda'.")
+                    st.stop()
 
             # Validasi kertas maklumat (multi upload)
             spu_files = spu_files or []
@@ -1247,13 +1286,10 @@ if gen:
 
             # Read all excel files
             rows = []
-
             for f in spu_files:
                 rows += read_kertas_excel(f.read(), "SPU")
-
             for f in sps_files:
                 rows += read_kertas_excel(f.read(), "SPS")
-
             for f in spt_files:
                 rows += read_kertas_excel(f.read(), "SPT")
 
@@ -1301,6 +1337,8 @@ if gen:
                     "Kategori 4": len(cat4),
                     "Kategori 5": len(cat5),
                     "Agenda digunakan?": "YA" if agenda_enabled else "TIDAK (Teruskan tanpa Agenda)",
+                    "Audio intro dijumpai?": "YA" if INTRO_AUDIO else "TIDAK (fail mp3 tak jumpa)",
+                    "Audio jana dijumpai?": "YA" if GEN_AUDIO else "TIDAK (fail mp3 tak jumpa)",
                 })
     finally:
         st.session_state.running = False
