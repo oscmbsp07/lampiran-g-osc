@@ -62,7 +62,7 @@ GEN_AUDIO_PATH = os.path.join("assets", "Lampiran G sedang dijana.mp3")
 
 
 # ============================================================
-# AUDIO (AUTO) - TANPA CHECKBOX, TANPA key= pada components.html
+# AUDIO (AUTO) - INTRO REPLAY SETIAP REFRESH / BUKA SEMULA
 # ============================================================
 def _read_bytes(path: str) -> Optional[bytes]:
     try:
@@ -75,36 +75,39 @@ def _read_bytes(path: str) -> Optional[bytes]:
 def play_audio_html(
     audio_bytes: bytes,
     element_id: str,
-    play_once_storage_key: Optional[str] = None,
+    once_per_page_flag: Optional[str] = None,
     bind_first_gesture: bool = True,
 ) -> None:
     """
-    Autoplay attempt. Jika browser block autoplay,
-    bunyi akan main bila user buat first click/keydown/touchstart.
-
-    play_once_storage_key:
-      - jika diberi, guna localStorage untuk pastikan main sekali sahaja (per browser).
+    - Cuba autoplay masa load.
+    - Jika browser block autoplay, main bila user klik/keydown/touchstart pertama.
+    - once_per_page_flag: guard "sekali per page-load" guna window.top.__FLAG (reset bila refresh/close/open).
     """
     if not audio_bytes:
         return
 
     b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
-    storage_guard_js = ""
-    if play_once_storage_key:
-        storage_guard_js = f"""
-        const storageKey = "{play_once_storage_key}";
+    page_guard_js = ""
+    if once_per_page_flag:
+        page_guard_js = f"""
+        // Guard sekali per page-load (tak simpan dalam localStorage)
+        const FLAG = "__{once_per_page_flag}";
         try {{
-          if (localStorage.getItem(storageKey) === "1") {{
+          const topw = window.top || window.parent || window;
+          if (topw[FLAG] === true) {{
             return;
           }}
-        }} catch (e) {{}}
+        }} catch(e) {{}}
         """
 
     mark_played_js = ""
-    if play_once_storage_key:
+    if once_per_page_flag:
         mark_played_js = f"""
-        try {{ localStorage.setItem("{play_once_storage_key}", "1"); }} catch (e) {{}}
+        try {{
+          const topw = window.top || window.parent || window;
+          topw["__{once_per_page_flag}"] = true;
+        }} catch(e) {{}}
         """
 
     html = f"""
@@ -122,7 +125,7 @@ def play_audio_html(
 
         <script>
           (function() {{
-            {storage_guard_js}
+            {page_guard_js}
 
             const audio = document.getElementById("{element_id}");
             if (!audio) return;
@@ -137,7 +140,6 @@ def play_audio_html(
                   if ({str(bind_first_gesture).lower()}) bindOnce();
                 }});
               }} else {{
-                // fallback old browser
                 {mark_played_js}
               }}
             }}
@@ -147,15 +149,13 @@ def play_audio_html(
               if (bound) return;
               bound = true;
 
-              // cuba attach pada parent/top (lebih reliable untuk click di luar iframe)
               const docs = [];
-              try {{ if (window.parent && window.parent.document) docs.push(window.parent.document); }} catch(e) {{}}
               try {{ if (window.top && window.top.document) docs.push(window.top.document); }} catch(e) {{}}
+              try {{ if (window.parent && window.parent.document) docs.push(window.parent.document); }} catch(e) {{}}
               docs.push(document);
 
-              const handler = (ev) => {{
+              const handler = () => {{
                 tryPlay();
-                // buang semua listener selepas trigger
                 docs.forEach(d => {{
                   try {{
                     d.removeEventListener("click", handler, true);
@@ -174,11 +174,10 @@ def play_audio_html(
               }});
             }}
 
-            // cuba autoplay sekarang
+            // Cuba autoplay sekarang
             tryPlay();
 
-            // kalau autoplay block tapi browser tak reject (kes tertentu),
-            // tetap bind gesture sebagai backup
+            // Backup: kalau autoplay block tapi tak reject jelas
             if ({str(bind_first_gesture).lower()}) {{
               setTimeout(() => {{
                 try {{
@@ -194,17 +193,15 @@ def play_audio_html(
     </html>
     """
 
-    # jangan pass key= (server awak tak support)
     components.html(html, height=1, width=1, scrolling=False)
 
 
 INTRO_AUDIO = _read_bytes(INTRO_AUDIO_PATH)
 GEN_AUDIO = _read_bytes(GEN_AUDIO_PATH)
 
-# Optional: bagi hint kalau file intro tak jumpa (ini penting untuk detect cepat)
+# Tip cepat kalau path salah (Linux case sensitive)
 if INTRO_AUDIO is None:
     st.info("Nota: Fail audio intro tak dijumpai. Pastikan ada: assets/Selamat Datang OSC.mp3")
-
 if GEN_AUDIO is None:
     st.info("Nota: Fail audio jana tak dijumpai. Pastikan ada: assets/Lampiran G sedang dijana.mp3")
 
@@ -1128,13 +1125,12 @@ bg_ok = _inject_bg_and_css("assets/bg.jpg")
 if not bg_ok:
     st.warning("Background tidak dijumpai. Pastikan fail ada di folder assets/ (contoh: assets/bg.jpg).")
 
-# ====== INTRO AUDIO AUTO (sentiasa render; localStorage akan stop lepas main sekali) ======
-# NOTE: Ini akan bunyi selepas FIRST CLICK/KEYDOWN jika autoplay block.
+# ====== INTRO AUDIO AUTO (main semula setiap refresh/open; dalam page sama, tak ulang sebab guard window.top) ======
 if INTRO_AUDIO:
     play_audio_html(
         INTRO_AUDIO,
         element_id="intro_audio_osc",
-        play_once_storage_key="lampiranG_intro_played_v3",
+        once_per_page_flag="LAMPIRAN_G_INTRO_PLAYED",
         bind_first_gesture=True,
     )
 
@@ -1210,13 +1206,13 @@ with mid:
 if gen:
     st.session_state.running = True
     try:
-        # ====== AUDIO "SEDANG JANA" ======
+        # ====== AUDIO "SEDANG JANA" (main setiap klik butang) ======
         if GEN_AUDIO:
             st.session_state.gen_audio_counter += 1
             play_audio_html(
                 GEN_AUDIO,
                 element_id=f"gen_audio_{st.session_state.gen_audio_counter}",
-                play_once_storage_key=None,
+                once_per_page_flag=None,
                 bind_first_gesture=False,
             )
 
