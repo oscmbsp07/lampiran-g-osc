@@ -17,8 +17,6 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
-import streamlit.components.v1 as components
-
 
 # ============================================================
 # CONFIG
@@ -45,8 +43,10 @@ ALLOWED_SHEETS = {
     "LJUP",
 }
 
+# Urutan daerah untuk sort
 DAERAH_ORDER = {"SPU": 0, "SPS": 1, "SPT": 2}
 
+# Kod rujukan
 KNOWN_CODES = [
     "PKM", "TKR-GUNA", "TKR", "124A", "204D", "PS", "SB", "CT",
     "KTUP", "LJUP", "JP", "PL",
@@ -57,162 +57,17 @@ BGN_CODES = {"BGN", "EVCB", "EV", "TELCO"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
 
-INTRO_AUDIO_PATH = os.path.join("assets", "Selamat Datang OSC.mp3")
-GEN_AUDIO_PATH = os.path.join("assets", "Lampiran G sedang dijana.mp3")
-
-
-# ============================================================
-# AUDIO (AUTO) - INTRO REPLAY SETIAP REFRESH / BUKA SEMULA
-# ============================================================
-def _read_bytes(path: str) -> Optional[bytes]:
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except Exception:
-        return None
-
-
-def play_audio_html(
-    audio_bytes: bytes,
-    element_id: str,
-    once_per_page_flag: Optional[str] = None,
-    bind_first_gesture: bool = True,
-) -> None:
-    """
-    - Cuba autoplay masa load.
-    - Jika browser block autoplay, main bila user klik/keydown/touchstart pertama.
-    - once_per_page_flag: guard "sekali per page-load" guna window.top.__FLAG (reset bila refresh/close/open).
-    """
-    if not audio_bytes:
-        return
-
-    b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-    page_guard_js = ""
-    if once_per_page_flag:
-        page_guard_js = f"""
-        // Guard sekali per page-load (tak simpan dalam localStorage)
-        const FLAG = "__{once_per_page_flag}";
-        try {{
-          const topw = window.top || window.parent || window;
-          if (topw[FLAG] === true) {{
-            return;
-          }}
-        }} catch(e) {{}}
-        """
-
-    mark_played_js = ""
-    if once_per_page_flag:
-        mark_played_js = f"""
-        try {{
-          const topw = window.top || window.parent || window;
-          topw["__{once_per_page_flag}"] = true;
-        }} catch(e) {{}}
-        """
-
-    html = f"""
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <style>
-          html, body {{ margin:0; padding:0; height:0; overflow:hidden; background:transparent; }}
-        </style>
-      </head>
-      <body>
-        <audio id="{element_id}" preload="auto">
-          <source src="data:audio/mpeg;base64,{b64}" type="audio/mpeg" />
-        </audio>
-
-        <script>
-          (function() {{
-            {page_guard_js}
-
-            const audio = document.getElementById("{element_id}");
-            if (!audio) return;
-
-            function tryPlay() {{
-              try {{ audio.currentTime = 0; }} catch(e) {{}}
-              const p = audio.play();
-              if (p && typeof p.then === "function") {{
-                p.then(() => {{
-                  {mark_played_js}
-                }}).catch(() => {{
-                  if ({str(bind_first_gesture).lower()}) bindOnce();
-                }});
-              }} else {{
-                {mark_played_js}
-              }}
-            }}
-
-            let bound = false;
-            function bindOnce() {{
-              if (bound) return;
-              bound = true;
-
-              const docs = [];
-              try {{ if (window.top && window.top.document) docs.push(window.top.document); }} catch(e) {{}}
-              try {{ if (window.parent && window.parent.document) docs.push(window.parent.document); }} catch(e) {{}}
-              docs.push(document);
-
-              const handler = () => {{
-                tryPlay();
-                docs.forEach(d => {{
-                  try {{
-                    d.removeEventListener("click", handler, true);
-                    d.removeEventListener("keydown", handler, true);
-                    d.removeEventListener("touchstart", handler, true);
-                  }} catch(e) {{}}
-                }});
-              }};
-
-              docs.forEach(d => {{
-                try {{
-                  d.addEventListener("click", handler, true);
-                  d.addEventListener("keydown", handler, true);
-                  d.addEventListener("touchstart", handler, true);
-                }} catch(e) {{}}
-              }});
-            }}
-
-            // Cuba autoplay sekarang
-            tryPlay();
-
-            // Backup: kalau autoplay block tapi tak reject jelas
-            if ({str(bind_first_gesture).lower()}) {{
-              setTimeout(() => {{
-                try {{
-                  if (audio.paused) bindOnce();
-                }} catch(e) {{
-                  bindOnce();
-                }}
-              }}, 150);
-            }}
-          }})();
-        </script>
-      </body>
-    </html>
-    """
-
-    components.html(html, height=1, width=1, scrolling=False)
-
-
-INTRO_AUDIO = _read_bytes(INTRO_AUDIO_PATH)
-GEN_AUDIO = _read_bytes(GEN_AUDIO_PATH)
-
-# Tip cepat kalau path salah (Linux case sensitive)
-if INTRO_AUDIO is None:
-    st.info("Nota: Fail audio intro tak dijumpai. Pastikan ada: assets/Selamat Datang OSC.mp3")
-if GEN_AUDIO is None:
-    st.info("Nota: Fail audio jana tak dijumpai. Pastikan ada: assets/Lampiran G sedang dijana.mp3")
-
-if "gen_audio_counter" not in st.session_state:
-    st.session_state.gen_audio_counter = 0
-
 
 # ============================================================
 # UI HELPERS (BACKGROUND + CSS)
 # ============================================================
 def _inject_bg_and_css(img_path: str) -> bool:
+    """
+    Background fixed layer + CSS stabilizer:
+    - elak 'zoom' bila rerun (upload/click)
+    - scrollbar sentiasa wujud tapi disorok (tak jadi width berubah)
+    - panel container border=True jadi kemas tanpa div kosong
+    """
     try:
         with open(img_path, "rb") as f:
             data = f.read()
@@ -250,6 +105,7 @@ def _inject_bg_and_css(img_path: str) -> bool:
     css = f"""
     <style>
       html, body {{ height: 100%; }}
+
       body {{
         overflow-y: scroll;
         scrollbar-width: none;
@@ -260,19 +116,24 @@ def _inject_bg_and_css(img_path: str) -> bool:
         height: 0px;
         background: transparent;
       }}
+
       header, footer {{
         visibility: hidden;
         height: 0;
       }}
+
       .stApp {{
         background: transparent !important;
       }}
+
       {bg_css}
+
       section.main > div.block-container {{
         max-width: 1200px;
         padding-top: 0.8rem;
         padding-bottom: 0.8rem;
       }}
+
       .app-title {{
         text-align: center;
         font-weight: 900;
@@ -282,7 +143,11 @@ def _inject_bg_and_css(img_path: str) -> bool:
         color: white;
         text-shadow: 0px 2px 14px rgba(0,0,0,0.55);
       }}
-      .hero-spacer {{ height: 22vh; }}
+
+      .hero-spacer {{
+        height: 22vh;
+      }}
+
       div[data-testid="stVerticalBlockBorderWrapper"] {{
         background: rgba(0,0,0,0.44) !important;
         border: 1px solid rgba(255,255,255,0.12) !important;
@@ -291,9 +156,18 @@ def _inject_bg_and_css(img_path: str) -> bool:
         box-shadow: 0 10px 30px rgba(0,0,0,0.25);
         backdrop-filter: blur(2px);
       }}
-      h1 a, h2 a, h3 a {{ display: none !important; }}
-      label {{ font-size: 0.85rem !important; }}
-      .stTextInput input {{ height: 2.35rem !important; }}
+
+      h1 a, h2 a, h3 a {{
+        display: none !important;
+      }}
+
+      label {{
+        font-size: 0.85rem !important;
+      }}
+      .stTextInput input {{
+        height: 2.35rem !important;
+      }}
+
       div.stButton > button {{
         width: 100%;
         border-radius: 14px;
@@ -330,6 +204,9 @@ def clean_str(v) -> str:
 
 
 def is_blankish_text(v) -> bool:
+    """
+    Anggap kosong jika: None / "" / "-" / "—" / "–" / "N/A" / "NA" / "TIADA" / "NIL"
+    """
     if v is None or is_nan(v):
         return True
     s = str(v).strip()
@@ -338,12 +215,14 @@ def is_blankish_text(v) -> bool:
     s2 = s.lower()
     if s2 in {"-", "—", "–", "n/a", "na", "nil", "tiada"}:
         return True
+    # kadang staf letak dash dengan ruang
     if re.fullmatch(r"[-–—\s]+", s):
         return True
     return False
 
 
 def parse_date_from_cell(val) -> Optional[dt.date]:
+    """Terima datetime/date/excel-serial/string seperti '73 Hari (27/12/2025)'."""
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return None
     if isinstance(val, dt.datetime):
@@ -397,6 +276,11 @@ def nama_norm(x: str) -> str:
 
 
 def keputusan_is_empty(v) -> bool:
+    """
+    Keputusan dianggap "kosong" jika:
+    - empty / dash / tiada / nil / n/a
+    Jika ada apa-apa teks lain (batal/tarik balik/lulus/tolak/dll) -> dianggap ADA keputusan.
+    """
     if v is None or is_nan(v):
         return True
     s = str(v).strip()
@@ -404,6 +288,7 @@ def keputusan_is_empty(v) -> bool:
         return True
     if re.fullmatch(r"[-–—\s]+", s):
         return True
+    # Jika ada tarikh atau apa-apa isi lain -> dianggap ada keputusan
     if parse_date_from_cell(s) is not None:
         return False
     return False
@@ -438,6 +323,7 @@ def extract_codes_and_labels(fail_no: str, sheet_name: str) -> Tuple[Set[str], s
 
 
 def split_fail_induk(fail_no: str) -> str:
+    """Fail Induk = bahagian No Rujukan OSC sebelum '-<kod+kod...>'."""
     s = str(fail_no or "").strip()
     if not s:
         return s
@@ -466,10 +352,18 @@ def perkara_3lines(d: Optional[dt.date]) -> str:
 
 
 def tindakan_ut(belum_text: str) -> str:
+    """
+    Convert list jabatan dari kolum "Belum memberi ulasan" -> TINDAKAN.
+    - Jika kod dalaman: tukar jadi "Pengarah ...."
+    - Jika luaran: kekal ringkas (uppercase)
+    - Anggap '-' / kosong sebagai TIADA
+    """
     if is_blankish_text(belum_text):
         return ""
 
     raw = str(belum_text).strip()
+
+    # pecahkan ikut pemisah biasa
     parts = [p.strip() for p in re.split(r"[,&/]+", raw) if p.strip()]
 
     internal_map = {
@@ -482,6 +376,7 @@ def tindakan_ut(belum_text: str) -> str:
         "PBRN": "Pengarah Perbandaran",
         "LESEN": "Pengarah Pelesenan",
         "JL": "Pengarah Landskap",
+        # boleh tambah lagi jika perlu
     }
 
     internal, external = [], []
@@ -505,7 +400,8 @@ def tindakan_ut(belum_text: str) -> str:
     internal = dedup(internal)
     external = dedup(external)
 
-    return "\n".join(internal + external).strip()
+    tindakan = "\n".join(internal + external).strip()
+    return tindakan
 
 
 # ============================================================
@@ -548,12 +444,20 @@ def parse_agenda_docx(file_bytes: bytes) -> Tuple[Set[str], Set[str]]:
 
 
 # ============================================================
-# EXCEL READER
+# EXCEL READER (auto-detect header row)
 # ============================================================
 HEADER_HINTS = [
-    "No. Rujukan OSC", "No. Rujukan", "Rujukan OSC",
-    "Pemaju", "Pemohon", "Daerah", "Mukim", "Lot",
-    "Tempoh Untuk Proses", "Tempoh Untuk Diberi", "Tarikh Keputusan",
+    "No. Rujukan OSC",
+    "No. Rujukan",
+    "Rujukan OSC",
+    "Pemaju",
+    "Pemohon",
+    "Daerah",
+    "Mukim",
+    "Lot",
+    "Tempoh Untuk Proses",
+    "Tempoh Untuk Diberi",
+    "Tarikh Keputusan",
 ]
 
 COL_CANDIDATES = {
@@ -635,7 +539,7 @@ def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
             if (is_nan(fail) or str(fail).strip() == "") and (is_nan(pem) or str(pem).strip() == ""):
                 continue
 
-            out.append({
+            rec = {
                 "daerah": daerah_label,
                 "sheet": sheet_clean,
                 "fail_no_raw": clean_str(fail),
@@ -646,7 +550,8 @@ def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
                 "ut_date": parse_date_from_cell(row.get(cols["ut"])) if "ut" in cols else None,
                 "belum": clean_str(row.get(cols["belum"])) if "belum" in cols else "",
                 "keputusan": clean_str(row.get(cols["keputusan"])) if "keputusan" in cols else "",
-            })
+            }
+            out.append(rec)
 
     return out
 
@@ -680,11 +585,14 @@ def build_categories(
     ut_enabled: bool,
     agenda_enabled: bool,
 ) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
+    # tapis global keputusan (kalau ada keputusan -> buang terus)
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
+    # tapis agenda (jika agenda digunakan)
     if agenda_enabled:
         rows = [r for r in rows if (r["osc_norm"] not in agenda_osc_set) and (r["nama_norm"] not in agenda_nama_set)]
 
+    # group by fail_induk (untuk handle serentak & dedup)
     by_induk: Dict[str, List[dict]] = {}
     for r in rows:
         by_induk.setdefault(r["fail_induk"], []).append(r)
@@ -724,6 +632,9 @@ def build_categories(
         jenis_ser = (f"{codes_join} {label_txt} (Serentak)".strip() if label_txt else f"{codes_join} (Serentak)").strip()
         fail_no_ser = f"{induk}-{codes_join}" if codes_join else induk
 
+        # ----------------------------
+        # KATEGORI 1 — KM (PB/BGN)
+        # ----------------------------
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & (PB_CODES - {"PS", "SB", "CT"}):
                 cat1.append(make_rec(1, "Pengarah Perancang Bandar", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-PB"))
@@ -741,23 +652,36 @@ def build_categories(
                     jenis = g["sheet"] + (f" {g['label']}" if g["label"] else "")
                     cat1.append(make_rec(1, "Pengarah Bangunan", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-BGN"))
 
+        # ----------------------------
+        # KATEGORI 2 — UT (SEMUA SHEET)
+        # Syarat:
+        # - ut_date dalam range UT
+        # - kolum "Belum memberi ulasan" mesti ADA isi sebenar (bukan kosong / '-' / '—')
+        # - keputusan mesti kosong (dah ditapis awal)
+        # ----------------------------
         if ut_enabled:
             for g in grp:
                 if not in_range(g.get("ut_date"), ut_start, ut_end):
                     continue
+
                 if is_blankish_text(g.get("belum")):
-                    continue
+                    continue  # kosong -> tak masuk
 
                 tindakan = tindakan_ut(g.get("belum", ""))
                 if is_blankish_text(tindakan):
-                    continue
+                    continue  # kalau tinggal '-' saja
 
                 perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {g['ut_date'].strftime('%d.%m.%Y')}."
                 jenis = (jenis_ser if is_ser else g["sheet"]) + (f" {g['label']}" if g["label"] else "")
                 fail_no = (fail_no_ser if is_ser else g["fail_no_raw"])
+
+                # extra_key: gabung ikut tindakan+ut_date supaya tak duplicate pelik
                 extra_key = f"{tindakan}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
                 cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, extra_key))
 
+        # ----------------------------
+        # KATEGORI 3/4/5 — KM
+        # ----------------------------
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & KEJ_CODES:
                 cat3.append(make_rec(3, "Pengarah Kejuruteraan", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-KEJ"))
@@ -805,7 +729,7 @@ def build_categories(
 
 
 # ============================================================
-# WORD FORMATTER (SAMA MACAM CODE AWAK)
+# WORD FORMATTER
 # ============================================================
 COL_WIDTHS_IN = [0.35, 1.8, 1.6, 1.6, 1.6, 0.6, 0.6, 0.75, 1.9]
 HEADERS = ["BIL", "TINDAKAN", "JENIS\nPERMOHONAN", "FAIL NO", "PEMAJU/PEMOHON", "DAERAH", "MUKIM", "LOT", "PERKARA"]
@@ -1125,15 +1049,6 @@ bg_ok = _inject_bg_and_css("assets/bg.jpg")
 if not bg_ok:
     st.warning("Background tidak dijumpai. Pastikan fail ada di folder assets/ (contoh: assets/bg.jpg).")
 
-# ====== INTRO AUDIO AUTO (main semula setiap refresh/open; dalam page sama, tak ulang sebab guard window.top) ======
-if INTRO_AUDIO:
-    play_audio_html(
-        INTRO_AUDIO,
-        element_id="intro_audio_osc",
-        once_per_page_flag="LAMPIRAN_G_INTRO_PLAYED",
-        bind_first_gesture=True,
-    )
-
 st.markdown("<h1 class='app-title'>LAMPIRAN G UNIT OSC</h1>", unsafe_allow_html=True)
 st.markdown("<div class='hero-spacer'></div>", unsafe_allow_html=True)
 
@@ -1177,11 +1092,7 @@ with right_col:
         st.markdown("**Agenda JK OSC (.docx)**")
         agenda_file = st.file_uploader("", type=["docx"], key="agenda_docx", label_visibility="collapsed")
 
-        proceed_without_agenda = st.checkbox(
-            "Teruskan tanpa Agenda",
-            value=False,
-            help="Tick jika agenda belum diterima. Sistem akan jana tanpa tapisan agenda."
-        )
+        proceed_without_agenda = st.checkbox("Teruskan tanpa Agenda", value=False, help="Tick jika agenda belum diterima. Sistem akan jana tanpa tapisan agenda.")
 
         st.markdown("**Kertas Maklumat (Excel) — SPU/SPS/SPT (boleh upload 1 atau 2 fail setiap daerah)**")
         st.caption("Nota: Hujung/awal tahun boleh jadi 2 fail (tahun lama + tahun baru). Sistem akan gabungkan.")
@@ -1206,16 +1117,6 @@ with mid:
 if gen:
     st.session_state.running = True
     try:
-        # ====== AUDIO "SEDANG JANA" (main setiap klik butang) ======
-        if GEN_AUDIO:
-            st.session_state.gen_audio_counter += 1
-            play_audio_html(
-                GEN_AUDIO,
-                element_id=f"gen_audio_{st.session_state.gen_audio_counter}",
-                once_per_page_flag=None,
-                bind_first_gesture=False,
-            )
-
         with st.spinner("Sedang jana Lampiran G... Sila tunggu."):
             km_start = _parse_ddmmyyyy(km_mula_str)
             km_end = _parse_ddmmyyyy(km_akhir_str)
@@ -1227,6 +1128,7 @@ if gen:
                 ut_start = None
                 ut_end = None
 
+            # Validasi Agenda
             agenda_enabled = True
             if proceed_without_agenda:
                 agenda_enabled = False
@@ -1235,6 +1137,7 @@ if gen:
                     st.error("Sila upload Agenda JK OSC (.docx) atau tick 'Teruskan tanpa Agenda'.")
                     st.stop()
 
+            # Validasi kertas maklumat (multi upload)
             spu_files = spu_files or []
             sps_files = sps_files or []
             spt_files = spt_files or []
@@ -1247,6 +1150,7 @@ if gen:
                 st.error("Maksimum 2 fail dibenarkan bagi setiap daerah (SPU/SPS/SPT).")
                 st.stop()
 
+            # Validasi tarikh KM/UT
             if km_start is None or km_end is None:
                 st.error("Sila isi tarikh KM Mula dan KM Akhir dalam format dd/mm/yyyy.")
                 st.stop()
@@ -1262,17 +1166,22 @@ if gen:
                     st.error("UT Mula tidak boleh lebih besar daripada UT Akhir.")
                     st.stop()
 
+            # Read agenda (jika digunakan)
             if agenda_enabled:
                 agenda_bytes = agenda_file.read()
                 agenda_osc_set, agenda_nama_set = parse_agenda_docx(agenda_bytes)
             else:
                 agenda_osc_set, agenda_nama_set = set(), set()
 
+            # Read all excel files
             rows = []
+
             for f in spu_files:
                 rows += read_kertas_excel(f.read(), "SPU")
+
             for f in sps_files:
                 rows += read_kertas_excel(f.read(), "SPS")
+
             for f in spt_files:
                 rows += read_kertas_excel(f.read(), "SPT")
 
