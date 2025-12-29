@@ -1,3 +1,7 @@
+# app.py
+# Lampiran G Generator (Padu v2) - agenda filter ikut FAIL INDUK + PTJ auto exclude
+# Dependencies: streamlit, pandas, openpyxl, python-docx, pillow, pytesseract
+
 import io
 import re
 import math
