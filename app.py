@@ -57,6 +57,10 @@ BGN_CODES = {"BGN", "EVCB", "EV", "TELCO"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
 
+# Kategori 2 (UT) — sheet dibenarkan sahaja
+UT_ALLOWED_SHEETS = {"SERENTAK", "PKM", "BGN"}
+UT_ALLOWED_SERENTAK_CODES = {"PKM", "BGN"}  # serentak UT: PKM/BGN sahaja (tiada kod lain)
+
 
 # ============================================================
 # UI HELPERS (BACKGROUND + CSS)
@@ -215,7 +219,6 @@ def is_blankish_text(v) -> bool:
     s2 = s.lower()
     if s2 in {"-", "—", "–", "n/a", "na", "nil", "tiada"}:
         return True
-    # kadang staf letak dash dengan ruang
     if re.fullmatch(r"[-–—\s]+", s):
         return True
     return False
@@ -288,7 +291,6 @@ def keputusan_is_empty(v) -> bool:
         return True
     if re.fullmatch(r"[-–—\s]+", s):
         return True
-    # Jika ada tarikh atau apa-apa isi lain -> dianggap ada keputusan
     if parse_date_from_cell(s) is not None:
         return False
     return False
@@ -362,8 +364,6 @@ def tindakan_ut(belum_text: str) -> str:
         return ""
 
     raw = str(belum_text).strip()
-
-    # pecahkan ikut pemisah biasa
     parts = [p.strip() for p in re.split(r"[,&/]+", raw) if p.strip()]
 
     internal_map = {
@@ -376,7 +376,6 @@ def tindakan_ut(belum_text: str) -> str:
         "PBRN": "Pengarah Perbandaran",
         "LESEN": "Pengarah Pelesenan",
         "JL": "Pengarah Landskap",
-        # boleh tambah lagi jika perlu
     }
 
     internal, external = [], []
@@ -400,45 +399,74 @@ def tindakan_ut(belum_text: str) -> str:
     internal = dedup(internal)
     external = dedup(external)
 
-    tindakan = "\n".join(internal + external).strip()
-    return tindakan
+    return "\n".join(internal + external).strip()
 
 
 # ============================================================
-# AGENDA PARSER (WORD .docx)
+# AGENDA PARSER (WORD .docx) — IGNORE PTJ (Penamaan Jalan & Taman)
 # ============================================================
 def parse_agenda_docx(file_bytes: bytes) -> Tuple[Set[str], Set[str]]:
+    """
+    Extract set No Rujukan OSC + set Tetuan dari Agenda.
+    SPECIAL RULE:
+    - Blok "KERTAS MESYUARAT BIL. OSC/PTJ/..." (Penamaan Jalan & Taman) DIABAIKAN
+      (tidak dimasukkan ke set untuk tapisan agenda).
+    """
     doc = Document(io.BytesIO(file_bytes))
     texts: List[str] = []
 
+    # paragraphs
     for p in doc.paragraphs:
         if p.text:
-            texts.append(p.text)
+            t = p.text.strip()
+            if t:
+                texts.append(t)
 
-    for t in doc.tables:
-        for row in t.rows:
+    # tables (append; order tak kritikal untuk block-split sebab guna regex)
+    for tb in doc.tables:
+        for row in tb.rows:
             for cell in row.cells:
                 if cell.text:
-                    texts.append(cell.text)
+                    t = cell.text.strip()
+                    if t:
+                        texts.append(t)
 
     full = "\n".join(texts)
 
-    osc_set: Set[str] = set()
-    for m in re.finditer(r"(MBSP[^\s]{5,60})", full, flags=re.IGNORECASE):
-        cand = m.group(1).splitlines()[0].strip(" ,.;")
-        if "MBSP" in cand.upper():
-            osc_set.add(osc_norm(cand))
-
-    nama_set: Set[str] = set()
-    for m in re.finditer(
-        r"\bTetuan\b\s*[:\-]?\s*([A-Za-z0-9&.,()/\-\s]{3,100})",
+    # split by each "KERTAS MESYUARAT" block
+    blocks = re.findall(
+        r"(KERTAS\s+MESYUARAT[^\n]*\n.*?)(?=\nKERTAS\s+MESYUARAT|\Z)",
         full,
-        flags=re.IGNORECASE,
-    ):
-        nm = m.group(1).splitlines()[0].strip()
-        nm = re.split(r"\s{2,}", nm)[0].strip()
-        if nm:
-            nama_set.add(nama_norm(nm))
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not blocks:
+        blocks = [full]
+
+    osc_set: Set[str] = set()
+    nama_set: Set[str] = set()
+
+    for blk in blocks:
+        # ignore PTJ blocks
+        header_line = (blk.strip().splitlines()[0] if blk.strip() else "")
+        if re.search(r"/\s*PTJ\s*/", header_line, flags=re.IGNORECASE):
+            continue
+
+        # No rujukan OSC (MBSP....)
+        for m in re.finditer(r"(MBSP[^\s]{5,60})", blk, flags=re.IGNORECASE):
+            cand = m.group(1).splitlines()[0].strip(" ,.;")
+            if "MBSP" in cand.upper():
+                osc_set.add(osc_norm(cand))
+
+        # Tetuan
+        for m in re.finditer(
+            r"\bTetuan\b\s*[:\-]?\s*([A-Za-z0-9&.,()/\-\s]{3,120})",
+            blk,
+            flags=re.IGNORECASE,
+        ):
+            nm = m.group(1).splitlines()[0].strip()
+            nm = re.split(r"\s{2,}", nm)[0].strip()
+            if nm:
+                nama_set.add(nama_norm(nm))
 
     return osc_set, nama_set
 
@@ -588,7 +616,7 @@ def build_categories(
     # tapis global keputusan (kalau ada keputusan -> buang terus)
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
-    # tapis agenda (jika agenda digunakan)
+    # tapis agenda (jika agenda digunakan) — PTJ telah di-ignore dalam parse_agenda_docx()
     if agenda_enabled:
         rows = [r for r in rows if (r["osc_norm"] not in agenda_osc_set) and (r["nama_norm"] not in agenda_nama_set)]
 
@@ -653,30 +681,44 @@ def build_categories(
                     cat1.append(make_rec(1, "Pengarah Bangunan", g, jenis, g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-BGN"))
 
         # ----------------------------
-        # KATEGORI 2 — UT (SEMUA SHEET)
+        # KATEGORI 2 — UT (STRICT)
         # Syarat:
         # - ut_date dalam range UT
         # - kolum "Belum memberi ulasan" mesti ADA isi sebenar (bukan kosong / '-' / '—')
         # - keputusan mesti kosong (dah ditapis awal)
+        # - SHEET DIBENARKAN SAHAJA: SERENTAK / PKM / BGN
+        # - SERENTAK: kod mesti hanya PKM/BGN sahaja (tiada kod lain)
         # ----------------------------
         if ut_enabled:
             for g in grp:
+                sheet_up = (g.get("sheet") or "").strip().upper()
+                if sheet_up not in UT_ALLOWED_SHEETS:
+                    continue
+
                 if not in_range(g.get("ut_date"), ut_start, ut_end):
                     continue
 
                 if is_blankish_text(g.get("belum")):
-                    continue  # kosong -> tak masuk
+                    continue
+
+                # STRICT SERENTAK (atau apa-apa rekod yang ditanda serentak)
+                if g.get("serentak"):
+                    if not union_codes:
+                        continue
+                    if not (union_codes <= UT_ALLOWED_SERENTAK_CODES):
+                        continue
+                    if not (union_codes & UT_ALLOWED_SERENTAK_CODES):
+                        continue
 
                 tindakan = tindakan_ut(g.get("belum", ""))
                 if is_blankish_text(tindakan):
-                    continue  # kalau tinggal '-' saja
+                    continue
 
                 perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {g['ut_date'].strftime('%d.%m.%Y')}."
-                jenis = (jenis_ser if is_ser else g["sheet"]) + (f" {g['label']}" if g["label"] else "")
-                fail_no = (fail_no_ser if is_ser else g["fail_no_raw"])
+                jenis = (jenis_ser if g.get("serentak") else g["sheet"]) + (f" {g['label']}" if g["label"] else "")
+                fail_no = (fail_no_ser if g.get("serentak") else g["fail_no_raw"])
 
-                # extra_key: gabung ikut tindakan+ut_date supaya tak duplicate pelik
-                extra_key = f"{tindakan}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
+                extra_key = f"{tindakan}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}|{sheet_up}"
                 cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, extra_key))
 
         # ----------------------------
@@ -731,7 +773,8 @@ def build_categories(
 # ============================================================
 # WORD FORMATTER
 # ============================================================
-COL_WIDTHS_IN = [0.35, 1.8, 1.6, 1.6, 1.6, 0.6, 0.6, 0.75, 1.9]
+# Fix header wrapping: besarkan BIL & DAERAH, kecilkan PERKARA sikit
+COL_WIDTHS_IN = [0.45, 1.8, 1.6, 1.6, 1.6, 0.75, 0.6, 0.75, 1.65]
 HEADERS = ["BIL", "TINDAKAN", "JENIS\nPERMOHONAN", "FAIL NO", "PEMAJU/PEMOHON", "DAERAH", "MUKIM", "LOT", "PERKARA"]
 
 
@@ -751,20 +794,31 @@ def get_font(size_pt: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def make_g_logo_png(diameter_px: int = 120, outline_px: int = 4, font_pt: int = 22) -> bytes:
-    img = Image.new("RGBA", (diameter_px, diameter_px), (255, 255, 255, 0))
-    dr = ImageDraw.Draw(img)
+def make_g_logo_png(diameter_px: int = 140, outline_px: int = 5, font_pt: int = 22) -> bytes:
+    """
+    Logo G (bulat) — lebih smooth (anti-alias) dengan supersampling.
+    Font: Times New Roman Bold (kalau ada), saiz 22pt (rujukan colleague).
+    """
+    scale = 4
+    D = int(diameter_px * scale)
+    outline = int(outline_px * scale)
 
-    pad = outline_px + 4
-    dr.ellipse((pad, pad, diameter_px - pad, diameter_px - pad), outline=(0, 0, 0, 255), width=outline_px)
+    img_hi = Image.new("RGBA", (D, D), (255, 255, 255, 0))
+    dr = ImageDraw.Draw(img_hi)
 
-    font = get_font(font_pt)
+    pad = outline + int(4 * scale)
+    dr.ellipse((pad, pad, D - pad, D - pad), outline=(0, 0, 0, 255), width=outline)
+
+    font = get_font(int(font_pt * scale))
     text = "G"
     bbox = dr.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    x = (diameter_px - tw) / 2 - bbox[0]
-    y = (diameter_px - th) / 2 - bbox[1]
+    x = (D - tw) / 2 - bbox[0]
+    y = (D - th) / 2 - bbox[1]
     dr.text((x, y), text, font=font, fill=(0, 0, 0, 255))
+
+    # downsample untuk smooth edge
+    img = img_hi.resize((diameter_px, diameter_px), resample=Image.Resampling.LANCZOS)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -800,7 +854,8 @@ def add_logo_first_page(sec, logo_png_bytes: bytes):
     p = hdr.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     run = p.add_run()
-    run.add_picture(io.BytesIO(logo_png_bytes), width=Inches(0.6))
+    # Besarkan sikit ikut contoh colleague
+    run.add_picture(io.BytesIO(logo_png_bytes), width=Inches(0.75))
 
 
 def set_paragraph_font(p, font_name: str, size_pt: float, bold: bool = False, align=None):
@@ -1092,7 +1147,11 @@ with right_col:
         st.markdown("**Agenda JK OSC (.docx)**")
         agenda_file = st.file_uploader("", type=["docx"], key="agenda_docx", label_visibility="collapsed")
 
-        proceed_without_agenda = st.checkbox("Teruskan tanpa Agenda", value=False, help="Tick jika agenda belum diterima. Sistem akan jana tanpa tapisan agenda.")
+        proceed_without_agenda = st.checkbox(
+            "Teruskan tanpa Agenda",
+            value=False,
+            help="Tick jika agenda belum diterima. Sistem akan jana tanpa tapisan agenda.",
+        )
 
         st.markdown("**Kertas Maklumat (Excel) — SPU/SPS/SPT (boleh upload 1 atau 2 fail setiap daerah)**")
         st.caption("Nota: Hujung/awal tahun boleh jadi 2 fail (tahun lama + tahun baru). Sistem akan gabungkan.")
@@ -1174,7 +1233,7 @@ if gen:
                 agenda_osc_set, agenda_nama_set = set(), set()
 
             # Read all excel files
-            rows = []
+            rows: List[dict] = []
 
             for f in spu_files:
                 rows += read_kertas_excel(f.read(), "SPU")
@@ -1229,6 +1288,9 @@ if gen:
                     "Kategori 4": len(cat4),
                     "Kategori 5": len(cat5),
                     "Agenda digunakan?": "YA" if agenda_enabled else "TIDAK (Teruskan tanpa Agenda)",
+                    "UT (sheet dibenarkan)": "SERENTAK/PKM/BGN sahaja",
+                    "UT (serentak dibenarkan)": "Kod PKM/BGN sahaja (tiada kod lain)",
+                    "Agenda (PTJ)": "Ignore (tak tapis)",
                 })
     finally:
         st.session_state.running = False
