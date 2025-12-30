@@ -1092,7 +1092,7 @@ def _find_font_path(prefer_bold: bool = True) -> Optional[str]:
     return None
 
 
-def make_g_logo_png(diameter_px: int = 140, outline_px: int = 4, font_pt: int = 26) -> bytes:
+def make_g_logo_png(diameter_px: int = 140, outline_px: int = 4, font_pt: int = 34) -> bytes:
     scale = 4
     D = diameter_px * scale
     img = Image.new("RGBA", (D, D), (255, 255, 255, 0))
