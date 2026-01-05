@@ -1469,6 +1469,7 @@ with mid:
 # ============================================================
 if gen:
     st.session_state.running = True
+
     try:
         with st.spinner("Sedang jana Lampiran G..."):
             km_start = _parse_ddmmyyyy(km_mula_str)
@@ -1581,5 +1582,10 @@ if gen:
                     "Sheet ditapis agenda": sorted(list(AGENDA_FILTER_SHEETS)),
                     "Rule tapisan agenda": "TAIL-BASED (No Unik Hujung) — PTJ dikecualikan",
                 })
+
+    except Exception as e:
+        st.error("Proses jana Lampiran G gagal. Ini punca ralat (auto keluar):")
+        st.exception(e)
+
     finally:
         st.session_state.running = False
