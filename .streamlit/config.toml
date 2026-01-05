@@ -1,2 +1,4 @@
 [server]
+# Nilai dalam MB. 1024 = ~1GB
 maxUploadSize = 1024
+maxMessageSize = 1024
