@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Tuple, Set
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
-from openpyxl import load_workbook
 
 from docx import Document
 from docx.enum.section import WD_ORIENTATION, WD_SECTION
@@ -46,12 +45,12 @@ ALLOWED_SHEETS = {
     "LJUP",
 }
 
-# Tapisan agenda TERHAD (ikut arahan terbaru user):
-# ONLY: SERENTAK, PKM, TKR-GUNA/TG, PKM TUKARGUNA, BGN, TELCO, EVCB cluster (BGN EVCB/EVCB/EV)
+# Tapisan agenda TERHAD (ikut arahan terbaru user)
+# NOTE: EV termasuk dalam cluster EVCB (kadang kertas maklumat guna "EV" sahaja).
 AGENDA_FILTER_SHEETS = {
     "SERENTAK",
     "PKM",
-    "TKR-GUNA",
+    "TKR-GUNA",        # termasuk variasi "TG" melalui canonical mapping
     "PKM TUKARGUNA",
     "BGN",
     "TELCO",
@@ -72,7 +71,7 @@ PB_CODES = {"PKM", "TKR-GUNA", "TKR", "124A", "204D", "PS", "SB", "CT"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
 
-# UT rules (kekal)
+# UT rules kekal (boleh refine kemudian jika perlu)
 UT_ALLOWED_SHEETS = {"SERENTAK", "PKM", "BGN", "BGN EVCB", "TKR-GUNA", "PKM TUKARGUNA", "TKR"}
 SERENTAK_UT_ALLOWED_INDUK = {"PB", "PKM", "BGN"}
 
@@ -289,13 +288,15 @@ def canonical_sheet_name(sheet: str) -> str:
     - "TKR GUNA" dianggap "TKR-GUNA"
     - "PKM TUKAR GUNA" dianggap "PKM TUKARGUNA"
     - "BGN-EVCB" dianggap "BGN EVCB"
-    - "E V" jadi "EV"
+    - "E V" (jika ada spacing pelik) jadi "EV"
     """
-    s = sheet_norm(sheet).replace("_", " ")
+    s = sheet_norm(sheet)
+    s = s.replace("_", " ")
     s = re.sub(r"\s+", " ", s).strip()
 
     if s in {"E V"}:
         return "EV"
+
     if s in {"TG", "TUKARGUNA", "TUKAR GUNA"}:
         return "TKR-GUNA"
     if s in {"TKR GUNA", "TKR-GUNA"}:
@@ -304,6 +305,7 @@ def canonical_sheet_name(sheet: str) -> str:
         return "PKM TUKARGUNA"
     if s in {"BGN-EVCB", "BGN EVCB"}:
         return "BGN EVCB"
+
     return s
 
 
@@ -361,7 +363,7 @@ def _sheet_implied_codes(sheet_u: str) -> Set[str]:
     out = set()
     if "PKM" in s:
         out.add("PKM")
-    if "TKR-GUNA" in s or s == "TG":
+    if "TKR-GUNA" in s or s == "TKR GUNA" or s == "TG":
         out.add("TKR-GUNA")
     elif re.fullmatch(r"TKR", s):
         out.add("TKR")
@@ -401,7 +403,7 @@ def extract_codes(fail_no: str, sheet_name: str) -> Set[str]:
     sn = canonical_sheet_name(sheet_name)
     codes |= _sheet_implied_codes(sn)
 
-    if sn == "BGN EVCB":
+    if sn in {"BGN EVCB"}:
         codes.add("BGN")
         codes.add("EVCB")
     return codes
@@ -683,13 +685,12 @@ def _parse_agenda_block(block_text: str) -> AgendaBlock:
         osc_heads=osc_heads,
         tails=tails,
         series_tail_keys=series_tail_keys,
-        pemohon_key=pemohon_norm(pem),
+        pemohon_key=pem_key,
         lot_set=lot_set,
         has_osc=has_osc,
     )
 
 
-@st.cache_data(show_spinner=False)
 def parse_agenda_docx(file_bytes: bytes, enable_ocr: bool = False) -> AgendaIndex:
     doc = Document(io.BytesIO(file_bytes))
     text_main = _docx_collect_text(doc)
@@ -715,8 +716,10 @@ def parse_agenda_docx(file_bytes: bytes, enable_ocr: bool = False) -> AgendaInde
         if blk.is_ptj:
             continue
 
-        tails_all |= set(blk.tails)
-        series_tail_all |= set(blk.series_tail_keys)
+        for t in blk.tails:
+            tails_all.add(t)
+        for k in blk.series_tail_keys:
+            series_tail_all.add(k)
         for h in blk.osc_heads:
             osc_head_norm_all.add(osc_norm(h))
 
@@ -729,10 +732,7 @@ def parse_agenda_docx(file_bytes: bytes, enable_ocr: bool = False) -> AgendaInde
 
 
 # ============================================================
-# EXCEL READER — FAST (tahan fail Google Sheets bengkak)
-#   - load_workbook(read_only=True) => lebih ringan
-#   - tidak read sheet 2 kali
-#   - stop awal kalau banyak row kosong (formatting bengkak)
+# EXCEL READER (auto-detect header row)
 # ============================================================
 HEADER_HINTS = [
     "No. Rujukan OSC",
@@ -749,7 +749,7 @@ HEADER_HINTS = [
 ]
 
 COL_CANDIDATES = {
-    "fail_no": ["norujukanosc", "norujukan", "rujukanosc", "failno", "fail no", "no rujukan osc", "no rujukan"],
+    "fail_no": ["norujukanosc", "no rujukan osc", "rujukan osc", "fail no", "failno", "no rujukan"],
     "pemohon": ["pemajupemohon", "pemaju/pemohon", "pemaju", "pemohon", "tetuan"],
     "mukim": ["mukimseksyen", "mukim/seksyen", "mukim", "seksyen"],
     "lot": ["lot"],
@@ -768,127 +768,84 @@ def norm_basic(s: str) -> str:
     return s
 
 
-def _row_score(values: List[str]) -> int:
-    joined = " | ".join(values).lower()
-    score = 0
-    for h in HEADER_HINTS:
-        if h.lower() in joined:
-            score += 1
-    return score
-
-
-def _find_header_row_ws(ws, max_scan_rows: int = 80) -> Tuple[Optional[int], int]:
+def find_header_row(excel_bytes: bytes, sheet: str) -> Tuple[Optional[int], int]:
+    raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=None, engine="openpyxl", nrows=80)
     best_idx, best_score = None, 0
-    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=max_scan_rows, values_only=True), start=1):
-        vals = [str(v).strip() if v is not None else "" for v in row]
-        score = _row_score(vals)
+    for i in range(len(raw)):
+        row = raw.iloc[i].astype(str).fillna("")
+        joined = " | ".join(row.tolist())
+        score = 0
+        for h in HEADER_HINTS:
+            if h.lower() in joined.lower():
+                score += 1
         if score > best_score:
-            best_score = score
-            best_idx = i
+            best_score, best_idx = score, i
     return best_idx, best_score
 
 
-def _detect_col_indices(header_row_values: List[object]) -> Dict[str, int]:
-    norm_headers = [norm_basic(v) for v in header_row_values]
-    found: Dict[str, int] = {}
+def detect_columns(df: pd.DataFrame) -> Dict[str, str]:
+    norm_map = {col: norm_basic(col) for col in df.columns}
+    found: Dict[str, str] = {}
     for key, needles in COL_CANDIDATES.items():
         for needle in needles:
-            needle_n = norm_basic(needle)
-            for idx, h in enumerate(norm_headers):
-                if needle_n and needle_n in h:
-                    found[key] = idx
+            for col, ncol in norm_map.items():
+                if needle in ncol:
+                    found[key] = col
                     break
             if key in found:
                 break
     return found
 
 
-@st.cache_data(show_spinner=False)
-def read_kertas_excel_fast(excel_bytes: bytes, daerah_label: str) -> List[dict]:
+def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
     out: List[dict] = []
-    bio = io.BytesIO(excel_bytes)
+    xl = pd.ExcelFile(io.BytesIO(excel_bytes), engine="openpyxl")
 
-    # read_only=True => cepat & ringan untuk fail besar
-    wb = load_workbook(bio, read_only=True, data_only=True)
     allowed_upper = {s.upper() for s in ALLOWED_SHEETS}
 
-    for sheet_name in wb.sheetnames:
-        raw_name = (sheet_name or "").strip()
-        sheet_clean = canonical_sheet_name(raw_name)
+    for sheet in xl.sheet_names:
+        sheet_clean_raw = (sheet or "").strip()
+        sheet_clean = canonical_sheet_name(sheet_clean_raw)
 
         if sheet_clean.upper() not in allowed_upper:
             continue
 
-        ws = wb[sheet_name]
-        hdr_row, score = _find_header_row_ws(ws, max_scan_rows=80)
-        if hdr_row is None or score == 0:
+        hdr_idx, score = find_header_row(excel_bytes, sheet)
+        if hdr_idx is None or score == 0:
             continue
 
-        # ambil header row
-        header_vals = []
-        for cell in ws.iter_rows(min_row=hdr_row, max_row=hdr_row, values_only=True):
-            header_vals = list(cell)
-            break
-
-        col_idx = _detect_col_indices(header_vals)
-        if "fail_no" not in col_idx or "pemohon" not in col_idx:
+        df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=hdr_idx, engine="openpyxl")
+        df = df.dropna(how="all")
+        if df.empty:
             continue
 
-        # indices yang kita perlukan sahaja
-        idx_fail = col_idx.get("fail_no")
-        idx_pem = col_idx.get("pemohon")
-        idx_muk = col_idx.get("mukim")
-        idx_lot = col_idx.get("lot")
-        idx_km = col_idx.get("km")
-        idx_ut = col_idx.get("ut")
-        idx_belum = col_idx.get("belum")
-        idx_kep = col_idx.get("keputusan")
+        cols = detect_columns(df)
+        if "fail_no" not in cols or "pemohon" not in cols:
+            continue
 
-        # NOTE: Google Sheets eksport kadang ada "max_row" besar sebab formatting.
-        # Kita stop awal jika jumpa streak kosong panjang.
-        empty_streak = 0
-        EMPTY_STREAK_LIMIT = 250  # boleh naik/turun ikut real data
-
-        for row in ws.iter_rows(min_row=hdr_row + 1, values_only=True):
-            # ambil nilai ikut kolum
-            fail = row[idx_fail] if idx_fail is not None and idx_fail < len(row) else None
-            pem = row[idx_pem] if idx_pem is not None and idx_pem < len(row) else None
-
-            fail_s = str(fail).strip() if fail is not None else ""
-            pem_s = str(pem).strip() if pem is not None else ""
-
-            if fail_s == "" and pem_s == "":
-                empty_streak += 1
-                if empty_streak >= EMPTY_STREAK_LIMIT:
-                    break
+        for _, row in df.iterrows():
+            fail = row.get(cols["fail_no"])
+            pem = row.get(cols["pemohon"])
+            if (is_nan(fail) or str(fail).strip() == "") and (is_nan(pem) or str(pem).strip() == ""):
                 continue
 
-            empty_streak = 0
-
-            km_raw = row[idx_km] if idx_km is not None and idx_km < len(row) else None
-            ut_raw = row[idx_ut] if idx_ut is not None and idx_ut < len(row) else None
-
-            fail_raw = normalize_osc_prefix(clean_fail_no(fail_s))
+            km_raw = row.get(cols["km"]) if "km" in cols else None
+            fail_raw = normalize_osc_prefix(clean_fail_no(fail))
 
             rec = {
                 "daerah": daerah_label,
                 "sheet": sheet_clean,
                 "fail_no_raw": fail_raw,
                 "pemohon": clean_str(pem),
-                "mukim": clean_str(row[idx_muk]) if idx_muk is not None and idx_muk < len(row) else "",
-                "lot": clean_str(row[idx_lot]) if idx_lot is not None and idx_lot < len(row) else "",
-                "km_date": parse_date_from_cell(km_raw) if idx_km is not None else None,
-                "ut_date": parse_date_from_cell(ut_raw) if idx_ut is not None else None,
-                "belum": clean_str(row[idx_belum]) if idx_belum is not None and idx_belum < len(row) else "",
-                "keputusan": clean_str(row[idx_kep]) if idx_kep is not None and idx_kep < len(row) else "",
+                "mukim": clean_str(row.get(cols["mukim"])) if "mukim" in cols else "",
+                "lot": clean_str(row.get(cols["lot"])) if "lot" in cols else "",
+                "km_date": parse_date_from_cell(km_raw) if "km" in cols else None,
+                "ut_date": parse_date_from_cell(row.get(cols["ut"])) if "ut" in cols else None,
+                "belum": clean_str(row.get(cols["belum"])) if "belum" in cols else "",
+                "keputusan": clean_str(row.get(cols["keputusan"])) if "keputusan" in cols else "",
                 "induk_code": parse_induk_code(km_raw),
             }
             out.append(rec)
-
-    try:
-        wb.close()
-    except Exception:
-        pass
 
     return out
 
@@ -971,25 +928,20 @@ def build_categories(
 
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
-    # Tapisan agenda hanya untuk AGENDA_FILTER_SHEETS, dan PTJ dalam agenda dikecualikan (tak ditapis)
     if agenda_enabled and agenda:
         def _keep(r: dict) -> bool:
             if r["sheet_u"] not in AGENDA_FILTER_SHEETS:
                 return True
 
-            # PRIORITY ikut cara Unit OSC: NO UNIK HUJUNG (tail)
             if r.get("tail") and r["tail"] in agenda.tails_all:
                 return False
 
-            # backup lebih ketat: series|tail
             if r.get("series_tail") and r["series_tail"] in agenda.series_tail_all:
                 return False
 
-            # backup lagi: head normalized
             if r.get("osc_head_norm") and r["osc_head_norm"] in agenda.osc_head_norm_all:
                 return False
 
-            # fallback pemohon+lot (strict)
             if _agenda_fallback_match(r, agenda):
                 return False
 
@@ -1140,7 +1092,6 @@ def _find_font_path(prefer_bold: bool = True) -> Optional[str]:
     return None
 
 
-# NOTE: Besarkan huruf G => naikkan font_pt
 def make_g_logo_png(diameter_px: int = 140, outline_px: int = 4, font_pt: int = 34) -> bytes:
     scale = 4
     D = diameter_px * scale
@@ -1444,13 +1395,191 @@ if not bg_ok:
 st.markdown("<h1 class='app-title'>LAMPIRAN G UNIT OSC</h1>", unsafe_allow_html=True)
 st.markdown("<div class='hero-spacer'></div>", unsafe_allow_html=True)
 
-with st.expander("Nota Penting: Upload Limit 1GB (Setting Server)", expanded=False):
-    st.markdown(
-        """
-**Limit upload Streamlit tidak boleh diubah dalam Python code.**  
-Untuk naikkan limit sampai **1GB**, set dalam file config server:
+if "running" not in st.session_state:
+    st.session_state.running = False
 
-**.streamlit/config.toml**
-```toml
-[server]
-maxUploadSize = 1024  # MB (1GB)
+left_col, right_col = st.columns([1.15, 0.85], gap="large")
+
+with left_col:
+    with st.container(border=True):
+        st.markdown("### Maklumat Mesyuarat")
+        st.markdown("**Maklumat mesyuarat**")
+        meeting_info = st.text_input("", value="", key="meeting_info", label_visibility="collapsed")
+
+        st.markdown("### Tempoh Kertas Mesyuarat (KM)")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**KM Mula (dd/mm/yyyy)**")
+            km_mula_str = st.text_input("", value="", key="km_mula", label_visibility="collapsed")
+        with c2:
+            st.markdown("**KM Akhir (dd/mm/yyyy)**")
+            km_akhir_str = st.text_input("", value="", key="km_akhir", label_visibility="collapsed")
+
+        ut_enabled = st.checkbox("Aktifkan Ulasan Teknikal (UT)", value=True)
+
+        ut_mula_str, ut_akhir_str = "", ""
+        if ut_enabled:
+            st.markdown("### Tempoh Ulasan Teknikal (UT)")
+            u1, u2 = st.columns(2)
+            with u1:
+                st.markdown("**UT Mula (dd/mm/yyyy)**")
+                ut_mula_str = st.text_input("", value="", key="ut_mula", label_visibility="collapsed")
+            with u2:
+                st.markdown("**UT Akhir (dd/mm/yyyy)**")
+                ut_akhir_str = st.text_input("", value="", key="ut_akhir", label_visibility="collapsed")
+
+with right_col:
+    with st.container(border=True):
+        st.markdown("### Muat Naik Fail")
+
+        st.markdown("**Agenda JK OSC (.docx)**")
+        agenda_file = st.file_uploader("", type=["docx"], key="agenda_docx", label_visibility="collapsed")
+
+        enable_agenda_ocr = st.checkbox(
+            "Agenda scan (OCR) jika perlu",
+            value=False,
+            help="Jika agenda dalam bentuk gambar/scan. Jika server tiada OCR library, sistem akan teruskan tanpa OCR (tak crash).",
+        )
+
+        proceed_without_agenda = st.checkbox(
+            "Teruskan tanpa Agenda",
+            value=False,
+            help="Tick jika agenda belum diterima. Jika tick, sistem jana tanpa tapisan agenda.",
+        )
+
+        st.markdown("**Kertas Maklumat (Excel) — SPU/SPS/SPT (boleh upload 1 atau 2 fail setiap daerah)**")
+        st.caption("Nota: Hujung/awal tahun boleh jadi 2 fail (tahun lama + tahun baru). Sistem akan gabungkan.")
+
+        st.markdown("**SPU (maks 2 fail)**")
+        spu_files = st.file_uploader("", type=["xlsx", "xlsm"], key="spu_multi", label_visibility="collapsed", accept_multiple_files=True)
+
+        st.markdown("**SPS (maks 2 fail)**")
+        sps_files = st.file_uploader("", type=["xlsx", "xlsm"], key="sps_multi", label_visibility="collapsed", accept_multiple_files=True)
+
+        st.markdown("**SPT (maks 2 fail)**")
+        spt_files = st.file_uploader("", type=["xlsx", "xlsm"], key="spt_multi", label_visibility="collapsed", accept_multiple_files=True)
+
+mid = st.columns([1, 0.55, 1])[1]
+with mid:
+    gen = st.button("JANA LAMPIRAN G", type="primary", disabled=st.session_state.running)
+
+
+# ============================================================
+# ACTION (GENERATE)
+# ============================================================
+if gen:
+    st.session_state.running = True
+    try:
+        with st.spinner("Sedang jana Lampiran G..."):
+            km_start = _parse_ddmmyyyy(km_mula_str)
+            km_end = _parse_ddmmyyyy(km_akhir_str)
+
+            if ut_enabled:
+                ut_start = _parse_ddmmyyyy(ut_mula_str)
+                ut_end = _parse_ddmmyyyy(ut_akhir_str)
+            else:
+                ut_start = None
+                ut_end = None
+
+            agenda_enabled = True
+            if proceed_without_agenda:
+                agenda_enabled = False
+            else:
+                if not agenda_file:
+                    st.error("Sila upload Agenda JK OSC (.docx) atau tick 'Teruskan tanpa Agenda'.")
+                    st.stop()
+
+            spu_files = spu_files or []
+            sps_files = sps_files or []
+            spt_files = spt_files or []
+
+            if len(spu_files) == 0 or len(sps_files) == 0 or len(spt_files) == 0:
+                st.error("Sila upload sekurang-kurangnya 1 fail untuk setiap SPU, SPS dan SPT.")
+                st.stop()
+
+            if len(spu_files) > 2 or len(sps_files) > 2 or len(spt_files) > 2:
+                st.error("Maksimum 2 fail dibenarkan bagi setiap daerah (SPU/SPS/SPT).")
+                st.stop()
+
+            if km_start is None or km_end is None:
+                st.error("Sila isi tarikh KM Mula dan KM Akhir dalam format dd/mm/yyyy.")
+                st.stop()
+            if km_start > km_end:
+                st.error("KM Mula tidak boleh lebih besar daripada KM Akhir.")
+                st.stop()
+
+            if ut_enabled:
+                if ut_start is None or ut_end is None:
+                    st.error("Sila isi tarikh UT Mula dan UT Akhir dalam format dd/mm/yyyy.")
+                    st.stop()
+                if ut_start > ut_end:
+                    st.error("UT Mula tidak boleh lebih besar daripada UT Akhir.")
+                    st.stop()
+
+            agenda_index = None
+            if agenda_enabled:
+                agenda_bytes = agenda_file.read()
+                agenda_index = parse_agenda_docx(agenda_bytes, enable_ocr=enable_agenda_ocr)
+                if enable_agenda_ocr:
+                    try:
+                        import pytesseract  # type: ignore
+                    except Exception:
+                        st.warning("OCR tidak tersedia pada server ini. Sistem teruskan baca agenda tanpa OCR (text sahaja).")
+
+            rows: List[dict] = []
+            for f in spu_files:
+                rows += read_kertas_excel(f.read(), "SPU")
+            for f in sps_files:
+                rows += read_kertas_excel(f.read(), "SPS")
+            for f in spt_files:
+                rows += read_kertas_excel(f.read(), "SPT")
+
+            rows = enrich_rows(rows)
+
+            cat1, cat2, cat3, cat4, cat5 = build_categories(
+                rows=rows,
+                agenda=agenda_index,
+                km_start=km_start,
+                km_end=km_end,
+                ut_start=ut_start if ut_enabled else km_start,
+                ut_end=ut_end if ut_enabled else km_end,
+                ut_enabled=ut_enabled,
+                agenda_enabled=agenda_enabled,
+            )
+
+            doc_bytes = build_word_doc(
+                meeting_info=meeting_info.strip() if meeting_info.strip() else "JK OSC",
+                km_start=km_start,
+                km_end=km_end,
+                ut_start=ut_start if ut_enabled else km_start,
+                ut_end=ut_end if ut_enabled else km_end,
+                cat1=cat1,
+                cat2=cat2,
+                cat3=cat3,
+                cat4=cat4,
+                cat5=cat5,
+                ut_enabled=ut_enabled,
+            )
+
+            st.success("Lampiran G berjaya dijana.")
+            st.download_button(
+                "Muat turun Lampiran G (Word)",
+                data=doc_bytes,
+                file_name="Lampiran_G.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+            with st.expander("Ringkasan (untuk semakan cepat)"):
+                st.write({
+                    "Kategori 1": len(cat1),
+                    "Kategori 2": len(cat2) if ut_enabled else 0,
+                    "Kategori 3": len(cat3),
+                    "Kategori 4": len(cat4),
+                    "Kategori 5": len(cat5),
+                    "Agenda digunakan?": "YA" if agenda_enabled else "TIDAK (Teruskan tanpa Agenda)",
+                    "OCR agenda aktif?": "YA" if (agenda_enabled and enable_agenda_ocr) else "TIDAK",
+                    "Sheet ditapis agenda": sorted(list(AGENDA_FILTER_SHEETS)),
+                    "Rule tapisan agenda": "TAIL-BASED (No Unik Hujung) — PTJ dikecualikan",
+                })
+    finally:
+        st.session_state.running = False
