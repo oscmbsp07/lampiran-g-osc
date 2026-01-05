@@ -7,8 +7,9 @@ import datetime as dt
 import zipfile
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import xml.etree.ElementTree as ET
 
-import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
@@ -732,7 +733,7 @@ def parse_agenda_docx(file_bytes: bytes, enable_ocr: bool = False) -> AgendaInde
 
 
 # ============================================================
-# EXCEL READER (auto-detect header row)
+# EXCEL READER (ULTRA FAST XML - NO "STOP AWAL", NO FULL RANGE LOOP)
 # ============================================================
 HEADER_HINTS = [
     "No. Rujukan OSC",
@@ -759,6 +760,9 @@ COL_CANDIDATES = {
     "keputusan": ["tarikhkeputusankuasa", "tarikhkeputusan"],
 }
 
+_NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_NS_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
 
 def norm_basic(s: str) -> str:
     s = "" if s is None else str(s)
@@ -768,86 +772,321 @@ def norm_basic(s: str) -> str:
     return s
 
 
-def find_header_row(excel_bytes: bytes, sheet: str) -> Tuple[Optional[int], int]:
-    raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=None, engine="openpyxl", nrows=80)
-    best_idx, best_score = None, 0
-    for i in range(len(raw)):
-        row = raw.iloc[i].astype(str).fillna("")
-        joined = " | ".join(row.tolist())
-        score = 0
-        for h in HEADER_HINTS:
-            if h.lower() in joined.lower():
-                score += 1
+def _col_letters_to_index(col_letters: str) -> int:
+    # "A"->0, "B"->1, ..., "Z"->25, "AA"->26
+    col_letters = col_letters.upper()
+    n = 0
+    for ch in col_letters:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n - 1
+
+
+_CELL_REF_RE = re.compile(r"^([A-Z]+)(\d+)$")
+
+
+def _cell_ref_to_col_idx(cell_ref: str) -> Optional[int]:
+    if not cell_ref:
+        return None
+    m = _CELL_REF_RE.match(cell_ref.upper())
+    if not m:
+        return None
+    return _col_letters_to_index(m.group(1))
+
+
+def _load_shared_strings(z: zipfile.ZipFile) -> List[str]:
+    path = "xl/sharedStrings.xml"
+    if path not in z.namelist():
+        return []
+    data = z.read(path)
+    # Parse and flatten each <si>
+    root = ET.fromstring(data)
+    out: List[str] = []
+    for si in root.findall(f".//{_NS_MAIN}si"):
+        # concatenation of all <t> under <si>
+        texts = []
+        for t in si.findall(f".//{_NS_MAIN}t"):
+            if t.text:
+                texts.append(t.text)
+        out.append("".join(texts))
+    return out
+
+
+def _workbook_sheet_paths(z: zipfile.ZipFile) -> List[Tuple[str, str]]:
+    """
+    Return list of (sheet_name, sheet_xml_path like 'xl/worksheets/sheet1.xml')
+    """
+    wb_xml = z.read("xl/workbook.xml")
+    wb_root = ET.fromstring(wb_xml)
+
+    rels_xml = z.read("xl/_rels/workbook.xml.rels")
+    rels_root = ET.fromstring(rels_xml)
+
+    rid_to_target: Dict[str, str] = {}
+    for rel in rels_root.findall(f".//{_NS_REL}Relationship"):
+        rid = rel.attrib.get("Id", "")
+        target = rel.attrib.get("Target", "")
+        if rid and target:
+            # Target like 'worksheets/sheet1.xml'
+            if not target.startswith("xl/"):
+                target = "xl/" + target.lstrip("/")
+            rid_to_target[rid] = target
+
+    out: List[Tuple[str, str]] = []
+    sheets_el = wb_root.find(f".//{_NS_MAIN}sheets")
+    if sheets_el is None:
+        return out
+
+    for sh in sheets_el.findall(f"{_NS_MAIN}sheet"):
+        name = sh.attrib.get("name", "")
+        rid = sh.attrib.get(f"{{http://schemas.openxmlformats.org/officeDocument/2006/relationships}}id", "")
+        target = rid_to_target.get(rid, "")
+        if name and target:
+            out.append((name, target))
+    return out
+
+
+def _cell_value_from_c_el(c_el: ET.Element, shared_strings: List[str]) -> Optional[object]:
+    """
+    Decode a <c> cell element:
+    - t="s": shared string index in <v>
+    - t="inlineStr": text inside <is><t>
+    - t="b": boolean
+    - default: numeric or string in <v>
+    Ignore style-only empty cells (no <v> and no inline text).
+    """
+    t = c_el.attrib.get("t", "")
+    v_el = c_el.find(f"{_NS_MAIN}v")
+
+    if t == "inlineStr":
+        is_el = c_el.find(f"{_NS_MAIN}is")
+        if is_el is None:
+            return None
+        texts = []
+        for t_el in is_el.findall(f".//{_NS_MAIN}t"):
+            if t_el.text:
+                texts.append(t_el.text)
+        txt = "".join(texts).strip()
+        return txt if txt != "" else None
+
+    if v_el is None or v_el.text is None:
+        return None
+
+    raw = v_el.text
+
+    if t == "s":
+        try:
+            idx = int(raw)
+            if 0 <= idx < len(shared_strings):
+                return shared_strings[idx]
+            return None
+        except Exception:
+            return None
+
+    if t == "b":
+        return True if raw == "1" else False
+
+    # default: number or text
+    # If it looks numeric -> float/int
+    s = raw.strip()
+    if s == "":
+        return None
+    # Some exports store numeric as "123" or "123.0"
+    if re.fullmatch(r"-?\d+", s):
+        try:
+            return int(s)
+        except Exception:
+            return s
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        try:
+            return float(s)
+        except Exception:
+            return s
+
+    return s
+
+
+def _iter_sheet_rows_cells(
+    z: zipfile.ZipFile,
+    sheet_path: str,
+    shared_strings: List[str],
+    max_rows_to_scan: Optional[int] = None
+):
+    """
+    Generator yields (row_number:int, cells:Dict[col_idx:int, value])
+    Parses sheet XML and yields only rows that exist in XML (fast; no blank-range loop).
+    If max_rows_to_scan is set, stops after yielding that many distinct row numbers.
+    """
+    if sheet_path not in z.namelist():
+        return
+    with z.open(sheet_path) as f:
+        # iterparse for streaming
+        context = ET.iterparse(f, events=("end",))
+        yielded = 0
+        for event, elem in context:
+            if elem.tag == f"{_NS_MAIN}row":
+                r_attr = elem.attrib.get("r", "")
+                try:
+                    rnum = int(r_attr) if r_attr else None
+                except Exception:
+                    rnum = None
+
+                cells: Dict[int, object] = {}
+                for c in elem.findall(f"{_NS_MAIN}c"):
+                    ref = c.attrib.get("r", "")
+                    col_idx = _cell_ref_to_col_idx(ref)
+                    if col_idx is None:
+                        continue
+                    val = _cell_value_from_c_el(c, shared_strings)
+                    if val is None:
+                        continue
+                    cells[col_idx] = val
+
+                # yield even if cells empty? usually skip
+                if rnum is not None and cells:
+                    yield rnum, cells
+                    yielded += 1
+                    if max_rows_to_scan is not None and yielded >= max_rows_to_scan:
+                        break
+
+                elem.clear()
+
+
+def _row_cells_to_list(cells: Dict[int, object]) -> List[object]:
+    if not cells:
+        return []
+    mx = max(cells.keys())
+    out = [""] * (mx + 1)
+    for k, v in cells.items():
+        out[k] = v
+    return out
+
+
+def _header_score(joined_lower: str) -> int:
+    score = 0
+    for h in HEADER_HINTS:
+        if h.lower() in joined_lower:
+            score += 1
+    return score
+
+
+def _find_header_row_ultra(rows_iter) -> Tuple[Optional[int], Optional[List[object]]]:
+    """
+    Find best header row among scanned rows. Returns (header_row_number, header_values_list)
+    """
+    best_r = None
+    best_score = 0
+    best_vals: Optional[List[object]] = None
+
+    for rnum, cells in rows_iter:
+        vals = _row_cells_to_list(cells)
+        joined = " | ".join([str(x).strip() for x in vals if str(x).strip()]).lower()
+        if not joined:
+            continue
+        score = _header_score(joined)
         if score > best_score:
-            best_score, best_idx = score, i
-    return best_idx, best_score
+            best_score = score
+            best_r = rnum
+            best_vals = vals
+
+    if best_r is None or best_score == 0:
+        return None, None
+    return best_r, best_vals
 
 
-def detect_columns(df: pd.DataFrame) -> Dict[str, str]:
-    norm_map = {col: norm_basic(col) for col in df.columns}
-    found: Dict[str, str] = {}
+def _detect_columns_ultra(header_vals: List[object]) -> Dict[str, int]:
+    norm_cols = [norm_basic(x) for x in header_vals]
+    found: Dict[str, int] = {}
     for key, needles in COL_CANDIDATES.items():
         for needle in needles:
-            for col, ncol in norm_map.items():
+            for idx, ncol in enumerate(norm_cols):
                 if needle in ncol:
-                    found[key] = col
+                    found[key] = idx
                     break
             if key in found:
                 break
     return found
 
 
-def read_kertas_excel(excel_bytes: bytes, daerah_label: str) -> List[dict]:
+def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]:
+    """
+    Ultra-fast reader for bloated XLSX:
+    - parses xlsx zip XML directly
+    - does NOT loop blank "used range" rows
+    - does NOT "stop awal" by blank streak
+    - reads only actual cell nodes that exist
+    """
     out: List[dict] = []
-    xl = pd.ExcelFile(io.BytesIO(excel_bytes), engine="openpyxl")
-
     allowed_upper = {s.upper() for s in ALLOWED_SHEETS}
 
-    for sheet in xl.sheet_names:
-        sheet_clean_raw = (sheet or "").strip()
-        sheet_clean = canonical_sheet_name(sheet_clean_raw)
+    with zipfile.ZipFile(io.BytesIO(excel_bytes)) as z:
+        shared = _load_shared_strings(z)
+        sheet_paths = _workbook_sheet_paths(z)
 
-        if sheet_clean.upper() not in allowed_upper:
-            continue
-
-        hdr_idx, score = find_header_row(excel_bytes, sheet)
-        if hdr_idx is None or score == 0:
-            continue
-
-        df = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet, header=hdr_idx, engine="openpyxl")
-        df = df.dropna(how="all")
-        if df.empty:
-            continue
-
-        cols = detect_columns(df)
-        if "fail_no" not in cols or "pemohon" not in cols:
-            continue
-
-        for _, row in df.iterrows():
-            fail = row.get(cols["fail_no"])
-            pem = row.get(cols["pemohon"])
-            if (is_nan(fail) or str(fail).strip() == "") and (is_nan(pem) or str(pem).strip() == ""):
+        for sheet_name, sheet_path in sheet_paths:
+            sheet_clean = canonical_sheet_name(sheet_name)
+            if sheet_clean.upper() not in allowed_upper:
                 continue
 
-            km_raw = row.get(cols["km"]) if "km" in cols else None
-            fail_raw = normalize_osc_prefix(clean_fail_no(fail))
+            # Scan first ~120 actual rows (rows with cells) to find header
+            scan_iter = _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=120)
+            hdr_rnum, hdr_vals = _find_header_row_ultra(scan_iter)
+            if hdr_rnum is None or hdr_vals is None:
+                continue
 
-            rec = {
-                "daerah": daerah_label,
-                "sheet": sheet_clean,
-                "fail_no_raw": fail_raw,
-                "pemohon": clean_str(pem),
-                "mukim": clean_str(row.get(cols["mukim"])) if "mukim" in cols else "",
-                "lot": clean_str(row.get(cols["lot"])) if "lot" in cols else "",
-                "km_date": parse_date_from_cell(km_raw) if "km" in cols else None,
-                "ut_date": parse_date_from_cell(row.get(cols["ut"])) if "ut" in cols else None,
-                "belum": clean_str(row.get(cols["belum"])) if "belum" in cols else "",
-                "keputusan": clean_str(row.get(cols["keputusan"])) if "keputusan" in cols else "",
-                "induk_code": parse_induk_code(km_raw),
-            }
-            out.append(rec)
+            cols = _detect_columns_ultra(hdr_vals)
+            if "fail_no" not in cols or "pemohon" not in cols:
+                continue
+
+            fail_idx = cols.get("fail_no")
+            pem_idx = cols.get("pemohon")
+            mukim_idx = cols.get("mukim")
+            lot_idx = cols.get("lot")
+            km_idx = cols.get("km")
+            ut_idx = cols.get("ut")
+            belum_idx = cols.get("belum")
+            keputusan_idx = cols.get("keputusan")
+
+            # Iterate ALL data rows (only rows that exist in XML)
+            for rnum, cells in _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=None):
+                if rnum <= hdr_rnum:
+                    continue
+
+                # pull only needed indices from cells
+                fail = cells.get(fail_idx) if fail_idx is not None else None
+                pem = cells.get(pem_idx) if pem_idx is not None else None
+
+                fail_str = clean_fail_no(fail)
+                pem_str = clean_str(pem)
+
+                # mimic original behavior: skip if both empty
+                if (is_nan(fail) or fail_str == "") and (is_nan(pem) or pem_str == ""):
+                    continue
+
+                km_raw = cells.get(km_idx) if km_idx is not None else None
+                ut_raw = cells.get(ut_idx) if ut_idx is not None else None
+
+                rec = {
+                    "daerah": daerah_label,
+                    "sheet": sheet_clean,
+                    "fail_no_raw": normalize_osc_prefix(fail_str),
+                    "pemohon": pem_str,
+                    "mukim": clean_str(cells.get(mukim_idx)) if mukim_idx is not None else "",
+                    "lot": clean_str(cells.get(lot_idx)) if lot_idx is not None else "",
+                    "km_date": parse_date_from_cell(km_raw) if km_idx is not None else None,
+                    "ut_date": parse_date_from_cell(ut_raw) if ut_idx is not None else None,
+                    "belum": clean_str(cells.get(belum_idx)) if belum_idx is not None else "",
+                    "keputusan": clean_str(cells.get(keputusan_idx)) if keputusan_idx is not None else "",
+                    "induk_code": parse_induk_code(km_raw),
+                }
+                out.append(rec)
 
     return out
+
+
+@st.cache_data(show_spinner=False)
+def cached_read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]:
+    return read_kertas_excel_ultra(excel_bytes, daerah_label)
 
 
 # ============================================================
@@ -1046,13 +1285,13 @@ def build_categories(
                     cat5.append(make_rec(5, "Pengarah Perancang Bandar", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), f"NS-{g['sheet_u']}"))
 
     def dedup_list(lst: List[dict]) -> List[dict]:
-        seen, out = set(), []
+        seen, out2 = set(), []
         for r in lst:
             if r["dedup_key"] in seen:
                 continue
             seen.add(r["dedup_key"])
-            out.append(r)
-        return out
+            out2.append(r)
+        return out2
 
     cat1, cat2, cat3, cat4, cat5 = map(dedup_list, [cat1, cat2, cat3, cat4, cat5])
 
@@ -1519,7 +1758,7 @@ if gen:
 
             agenda_index = None
             if agenda_enabled:
-                agenda_bytes = agenda_file.read()
+                agenda_bytes = agenda_file.getvalue()
                 agenda_index = parse_agenda_docx(agenda_bytes, enable_ocr=enable_agenda_ocr)
                 if enable_agenda_ocr:
                     try:
@@ -1527,13 +1766,23 @@ if gen:
                     except Exception:
                         st.warning("OCR tidak tersedia pada server ini. Sistem teruskan baca agenda tanpa OCR (text sahaja).")
 
+            # --- ULTRA FAST PARALLEL READ (SPU/SPS/SPT) ---
             rows: List[dict] = []
-            for f in spu_files:
-                rows += read_kertas_excel(f.read(), "SPU")
-            for f in sps_files:
-                rows += read_kertas_excel(f.read(), "SPS")
-            for f in spt_files:
-                rows += read_kertas_excel(f.read(), "SPT")
+
+            def _read_one_bytes(b: bytes, daerah: str) -> List[dict]:
+                return cached_read_kertas_excel_ultra(b, daerah)
+
+            tasks = []
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                for f in spu_files:
+                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPU"))
+                for f in sps_files:
+                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPS"))
+                for f in spt_files:
+                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPT"))
+
+                for fut in as_completed(tasks):
+                    rows += fut.result()
 
             rows = enrich_rows(rows)
 
@@ -1581,6 +1830,7 @@ if gen:
                     "OCR agenda aktif?": "YA" if (agenda_enabled and enable_agenda_ocr) else "TIDAK",
                     "Sheet ditapis agenda": sorted(list(AGENDA_FILTER_SHEETS)),
                     "Rule tapisan agenda": "TAIL-BASED (No Unik Hujung) — PTJ dikecualikan",
+                    "Reader Excel": "ULTRA XML (skip used-range bloated, no early-stop blank loop)",
                 })
 
     except Exception as e:
