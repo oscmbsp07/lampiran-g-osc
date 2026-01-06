@@ -429,31 +429,151 @@ def perkara_3lines(d: Optional[dt.date]) -> str:
     return f"Penyediaan Kertas\nMesyuarat Tamat Tempoh\n{dd}"
 
 
+# ============================================================
+# DISPLAY FORMAT (PEMAJU/PEMOHON) — Proper Case for Lampiran G
+# ============================================================
+_ROMAN = {"i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","xiii","xiv","xv","xvi","xvii","xviii","xix","xx"}
+
+def format_pemohon_display(name: str) -> str:
+    """
+    Convert ALL CAPS (atau apa-apa casing) kepada 'Proper Case' untuk output Lampiran G,
+    dengan pengecualian/penetapan semula token korporat & akronim tertentu.
+    """
+    if is_blankish_text(name):
+        return ""
+
+    s = str(name).strip()
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+
+    # Title-case setiap chunk huruf (kekal simbol/pemutus)
+    base = re.sub(r"[A-Za-zÀ-ÿ]+", lambda m: m.group(0).lower().capitalize(), s)
+
+    # Fix common corp tokens & acronyms
+    repl = {
+        r"\bSdn\b": "Sdn",
+        r"\bBhd\b": "Bhd",
+        r"\bBerhad\b": "Berhad",
+        r"\bEnterprise\b": "Enterprise",
+        r"\bEnterprises\b": "Enterprises",
+        r"\bLlp\b": "LLP",
+        r"\bPlc\b": "PLC",
+        r"\bPlt\b": "PLT",
+        r"\bMbsp\b": "MBSP",
+        r"\bOsc\b": "OSC",
+        r"\bJk\b": "JK",
+        r"\bTnb\b": "TNB",
+        r"\bTm\b": "TM",
+    }
+    out = base
+    for pat, rep in repl.items():
+        out = re.sub(pat, rep, out)
+
+    # Roman numerals -> uppercase
+    def _roman_fix(m):
+        w = m.group(0)
+        if w.lower() in _ROMAN:
+            return w.upper()
+        return w
+
+    out = re.sub(r"\b[IVXLCDMivxlcdm]{1,6}\b", _roman_fix, out)
+
+    # Handle patterns like "M&E" / "T&C" -> uppercase letters around &
+    out = re.sub(r"\b([A-Za-z])\s*&\s*([A-Za-z])\b", lambda m: f"{m.group(1).upper()}&{m.group(2).upper()}", out)
+
+    # Final whitespace normalize
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out
+
+
+# ============================================================
+# UT "Belum memberi" mapper — tambah alias (KEJURUTERAAN, PERANCANG BANDAR, dll)
+# ============================================================
 def tindakan_ut(belum_text: str) -> str:
     if is_blankish_text(belum_text):
         return ""
     raw = str(belum_text).strip()
+
+    # Split list jabatan (support comma/&//)
     parts = [p.strip() for p in re.split(r"[,&/]+", raw) if p.strip()]
 
+    # Normalizer token: buang space + symbol, dan buang prefix umum
+    def _norm_token(x: str) -> str:
+        s = (x or "").upper().strip()
+        # buang prefix umum jika orang tulis "JABATAN KEJURUTERAAN" etc
+        s = re.sub(r"^(JABATAN|BAHAGIAN|UNIT|SEKSYEN)\s+", "", s)
+        s = re.sub(r"\s+", "", s)
+        s = re.sub(r"[^A-Z0-9]", "", s)
+        return s
+
+    # Mapping utama + alias (FORMAT UPDATE #1)
     internal_map = {
+        # KEJ
         "KEJ": "Pengarah Kejuruteraan",
+        "KEJURUTERAAN": "Pengarah Kejuruteraan",
+
+        # PB
         "PB": "Pengarah Perancang Bandar",
+        "PERANCANGBANDAR": "Pengarah Perancang Bandar",
+
+        # BGN
         "BGN": "Pengarah Bangunan",
+        "BANGUNAN": "Pengarah Bangunan",
+
+        # COB
         "COB": "Pengarah COB",
+        "PESURUHJAYABANGUNAN": "Pengarah COB",
+
+        # KES
         "KES": "Pengarah Kesihatan",
+        "KESIHATAN": "Pengarah Kesihatan",
+
+        # PEN
         "PEN": "Pengarah Penilaian",
+        "PENILAIAN": "Pengarah Penilaian",
+
+        # PBRN
         "PBRN": "Pengarah Perbandaran",
+        "PERBANDARAN": "Pengarah Perbandaran",
+
+        # LESEN
         "LESEN": "Pengarah Pelesenan",
+        "PELESENAN": "Pengarah Pelesenan",
+
+        # JL
         "JL": "Pengarah Landskap",
+        "LANDSKAP": "Pengarah Landskap",
     }
+
+    # Substring alias (lebih tolerant kalau token ada extra perkataan)
+    # Contoh: "JABATAN KEJURUTERAAN" -> KEJURUTERAAN in key
+    alias_substrings = [
+        ("KEJURUTERAAN", "Pengarah Kejuruteraan"),
+        ("PERANCANGBANDAR", "Pengarah Perancang Bandar"),
+        ("BANGUNAN", "Pengarah Bangunan"),
+        ("PESURUHJAYABANGUNAN", "Pengarah COB"),
+        ("KESIHATAN", "Pengarah Kesihatan"),
+        ("PENILAIAN", "Pengarah Penilaian"),
+        ("PERBANDARAN", "Pengarah Perbandaran"),
+        ("PELESENAN", "Pengarah Pelesenan"),
+        ("LANDSKAP", "Pengarah Landskap"),
+    ]
 
     internal, external = [], []
     for p in parts:
         if is_blankish_text(p):
             continue
-        key = re.sub(r"\s+", "", p.upper())
-        if key in internal_map:
-            internal.append(internal_map[key])
+        key = _norm_token(p)
+        mapped = internal_map.get(key)
+
+        if mapped is None:
+            for sub, title in alias_substrings:
+                if sub in key:
+                    mapped = title
+                    break
+
+        if mapped is not None:
+            internal.append(mapped)
         else:
             external.append(p.upper())
 
@@ -1240,7 +1360,7 @@ def build_categories(
             "tindakan": tindakan,
             "jenis": jenis,
             "fail_no": fail_no,
-            "pemohon": base_r["pemohon"],
+            "pemohon": base_r["pemohon"],  # (display formatting akan dibuat masa output Word)
             "daerah": base_r["daerah"],
             "mukim": base_r["mukim"],
             "lot": base_r["lot"],
@@ -1603,7 +1723,15 @@ def fill_table(tbl, recs: List[dict]):
     note_fields = ["bil", "tindakan", "jenis", "fail_no", "pemohon", "daerah", "mukim", "lot", "perkara"]
     for rec in recs:
         row = tbl.add_row()
-        vals = [str(rec.get(k, "")) for k in note_fields]
+
+        # FORMAT UPDATE #2: Pemaju/Pemohon sahaja -> Proper Case untuk output Lampiran G
+        vals = []
+        for k in note_fields:
+            if k == "pemohon":
+                vals.append(format_pemohon_display(str(rec.get(k, ""))))
+            else:
+                vals.append(str(rec.get(k, "")))
+
         for i, val in enumerate(vals):
             cell = row.cells[i]
             cell.text = ""
@@ -1887,6 +2015,8 @@ if gen:
                     "Rule tapisan agenda": "TAIL-BASED (No Unik Hujung) — PTJ dikecualikan",
                     "Reader Excel": "ULTRA XML + ROBUST FALLBACK (handle duplicate header lama+baru)",
                     "UT filter": "Row-level Jenis Permohonan (PKM/BGN family sahaja; KTUP/204D/124A auto reject)",
+                    "Update UT alias": "KEJURUTERAAN/PERANCANG BANDAR/BANGUNAN/... mapped to Pengarah",
+                    "Update Pemaju/Pemohon": "Proper Case untuk output Lampiran G",
                 })
 
     except Exception as e:
