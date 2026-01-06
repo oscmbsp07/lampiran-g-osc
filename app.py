@@ -283,14 +283,6 @@ def sheet_norm(s: str) -> str:
 
 
 def canonical_sheet_name(sheet: str) -> str:
-    """
-    Canonicalize variasi nama sheet dalam excel supaya:
-    - "TG" dianggap "TKR-GUNA"
-    - "TKR GUNA" dianggap "TKR-GUNA"
-    - "PKM TUKAR GUNA" dianggap "PKM TUKARGUNA"
-    - "BGN-EVCB" dianggap "BGN EVCB"
-    - "E V" (jika ada spacing pelik) jadi "EV"
-    """
     s = sheet_norm(sheet)
     s = s.replace("_", " ")
     s = re.sub(r"\s+", " ", s).strip()
@@ -348,7 +340,6 @@ def keputusan_is_empty(v) -> bool:
         return True
     if re.fullmatch(r"[-–—\s]+", s):
         return True
-    # Kalau ada tarikh dalam sel, kira "tak kosong"
     if parse_date_from_cell(s) is not None:
         return False
     return False
@@ -415,7 +406,6 @@ def split_fail_induk(fail_no: str) -> str:
     s = normalize_osc_prefix(str(fail_no or "")).strip()
     if not s:
         return s
-    # buang suffix code lepas '-' terakhir yang mengandungi code
     for i in range(len(s) - 1, 0, -1):
         if s[i] == "-":
             suffix = s[i + 1:].upper()
@@ -735,8 +725,7 @@ def parse_agenda_docx(file_bytes: bytes, enable_ocr: bool = False) -> AgendaInde
 
 
 # ============================================================
-# EXCEL READER (ULTRA FAST XML - AUTO PICK BEST COLUMN WHEN DUPLICATE HEADERS)
-# + SUPPORT FORMAT BARU: row-level "JENIS PERMOHONAN" (primary_code)
+# EXCEL READER (ULTRA FAST XML) + ROBUST PER-ROW FALLBACK
 # ============================================================
 HEADER_HINTS = [
     "No. Rujukan OSC",
@@ -771,12 +760,14 @@ COL_CANDIDATES = {
 _NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _NS_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
+
 def norm_basic(s: str) -> str:
     s = "" if s is None else str(s)
     s = s.strip().lower()
     s = re.sub(r"[\s\r\n\t]+", " ", s)
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
+
 
 def _col_letters_to_index(col_letters: str) -> int:
     col_letters = col_letters.upper()
@@ -786,7 +777,9 @@ def _col_letters_to_index(col_letters: str) -> int:
             n = n * 26 + (ord(ch) - ord("A") + 1)
     return n - 1
 
+
 _CELL_REF_RE = re.compile(r"^([A-Z]+)(\d+)$")
+
 
 def _cell_ref_to_col_idx(cell_ref: str) -> Optional[int]:
     if not cell_ref:
@@ -795,6 +788,7 @@ def _cell_ref_to_col_idx(cell_ref: str) -> Optional[int]:
     if not m:
         return None
     return _col_letters_to_index(m.group(1))
+
 
 def _load_shared_strings(z: zipfile.ZipFile) -> List[str]:
     path = "xl/sharedStrings.xml"
@@ -810,6 +804,7 @@ def _load_shared_strings(z: zipfile.ZipFile) -> List[str]:
                 texts.append(t.text)
         out.append("".join(texts))
     return out
+
 
 def _workbook_sheet_paths(z: zipfile.ZipFile) -> List[Tuple[str, str]]:
     wb_xml = z.read("xl/workbook.xml")
@@ -839,6 +834,7 @@ def _workbook_sheet_paths(z: zipfile.ZipFile) -> List[Tuple[str, str]]:
         if name and target:
             out.append((name, target))
     return out
+
 
 def _cell_value_from_c_el(c_el: ET.Element, shared_strings: List[str]) -> Optional[object]:
     t = c_el.attrib.get("t", "")
@@ -886,6 +882,7 @@ def _cell_value_from_c_el(c_el: ET.Element, shared_strings: List[str]) -> Option
             return s
     return s
 
+
 def _iter_sheet_rows_cells(
     z: zipfile.ZipFile,
     sheet_path: str,
@@ -924,6 +921,7 @@ def _iter_sheet_rows_cells(
 
                 elem.clear()
 
+
 def _row_cells_to_list(cells: Dict[int, object]) -> List[object]:
     if not cells:
         return []
@@ -933,12 +931,14 @@ def _row_cells_to_list(cells: Dict[int, object]) -> List[object]:
         out[k] = v
     return out
 
+
 def _header_score(joined_lower: str) -> int:
     score = 0
     for h in HEADER_HINTS:
         if h.lower() in joined_lower:
             score += 1
     return score
+
 
 def _find_header_row_ultra(rows_iter) -> Tuple[Optional[int], Optional[List[object]]]:
     best_r = None
@@ -960,6 +960,7 @@ def _find_header_row_ultra(rows_iter) -> Tuple[Optional[int], Optional[List[obje
         return None, None
     return best_r, best_vals
 
+
 def _detect_columns_candidates(header_vals: List[object]) -> Dict[str, List[int]]:
     norm_cols = [norm_basic(x) for x in header_vals]
     cand: Dict[str, List[int]] = {k: [] for k in COL_CANDIDATES.keys()}
@@ -972,6 +973,8 @@ def _detect_columns_candidates(header_vals: List[object]) -> Dict[str, List[int]
                     break
     return cand
 
+
+# --- ROBUST FALLBACK per-row (avoid "Pemaju/Lot kosong" bila duplicate header) ---
 def _is_nonempty(v) -> bool:
     if v is None:
         return False
@@ -979,7 +982,14 @@ def _is_nonempty(v) -> bool:
         s = v.strip()
         if s == "" or s.lower() == "nan":
             return False
+        if s.upper() in {"#N/A", "#VALUE!", "#REF!", "#DIV/0!", "#NAME?"}:
+            return False
+        if s.lower() in {"-", "—", "–", "n/a", "na", "nil", "tiada"}:
+            return False
+        if re.fullmatch(r"[-–—\s]+", s):
+            return False
     return True
+
 
 def _is_code_like(v) -> bool:
     if not _is_nonempty(v):
@@ -987,11 +997,11 @@ def _is_code_like(v) -> bool:
     s = str(v).upper()
     return bool(re.search(r"\b(PKM|TKR|TKR[-\s]?GUNA|124A|204D|PS|SB|CT|KTUP|LJUP|JP|PL|BGN|EVCB|EV|TELCO)\b", s))
 
-def _pick_best_column(cand_idxs: List[int], sample_rows: List[Dict[int, object]], prefer_code: bool = False) -> Optional[int]:
+
+def _rank_columns(cand_idxs: List[int], sample_rows: List[Dict[int, object]], prefer_code: bool = False) -> List[int]:
     if not cand_idxs:
-        return None
-    best_idx = None
-    best_score = -1
+        return []
+    scored = []
     for idx in cand_idxs:
         score = 0
         for cells in sample_rows:
@@ -1004,10 +1014,18 @@ def _pick_best_column(cand_idxs: List[int], sample_rows: List[Dict[int, object]]
             else:
                 if _is_nonempty(v):
                     score += 1
-        if score > best_score:
-            best_score = score
-            best_idx = idx
-    return best_idx if best_score > 0 else cand_idxs[0]
+        scored.append((score, idx))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [idx for _, idx in scored] if scored else cand_idxs
+
+
+def _pick_from_cols(cells: Dict[int, object], col_list: List[int]) -> Optional[object]:
+    for idx in col_list:
+        v = cells.get(idx)
+        if _is_nonempty(v):
+            return v
+    return None
+
 
 def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]:
     out: List[dict] = []
@@ -1022,41 +1040,41 @@ def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]
             if sheet_clean.upper() not in allowed_upper:
                 continue
 
-            scan_iter = _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=200)
+            scan_iter = _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=220)
             hdr_rnum, hdr_vals = _find_header_row_ultra(scan_iter)
             if hdr_rnum is None or hdr_vals is None:
                 continue
 
             cand = _detect_columns_candidates(hdr_vals)
 
-            # sample rows untuk resolve duplicate header (format lama + baru dalam satu sheet)
+            # sample rows lebih besar supaya cover campur lama+baru
             sample_rows: List[Dict[int, object]] = []
             for rnum, cells in _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=None):
                 if rnum <= hdr_rnum:
                     continue
                 sample_rows.append(cells)
-                if len(sample_rows) >= 60:
+                if len(sample_rows) >= 160:
                     break
 
-            fail_idx = _pick_best_column(cand.get("fail_no", []), sample_rows)
-            pem_idx = _pick_best_column(cand.get("pemohon", []), sample_rows)
-            mukim_idx = _pick_best_column(cand.get("mukim", []), sample_rows)
-            lot_idx = _pick_best_column(cand.get("lot", []), sample_rows)
-            jenis_idx = _pick_best_column(cand.get("jenis_perm", []), sample_rows, prefer_code=True)
-            km_idx = _pick_best_column(cand.get("km", []), sample_rows)
-            ut_idx = _pick_best_column(cand.get("ut", []), sample_rows)
-            belum_idx = _pick_best_column(cand.get("belum", []), sample_rows)
-            keputusan_idx = _pick_best_column(cand.get("keputusan", []), sample_rows)
+            fail_cols = _rank_columns(cand.get("fail_no", []), sample_rows)
+            pem_cols = _rank_columns(cand.get("pemohon", []), sample_rows)
+            mukim_cols = _rank_columns(cand.get("mukim", []), sample_rows)
+            lot_cols = _rank_columns(cand.get("lot", []), sample_rows)
+            jenis_cols = _rank_columns(cand.get("jenis_perm", []), sample_rows, prefer_code=True)
+            km_cols = _rank_columns(cand.get("km", []), sample_rows)
+            ut_cols = _rank_columns(cand.get("ut", []), sample_rows)
+            belum_cols = _rank_columns(cand.get("belum", []), sample_rows)
+            keputusan_cols = _rank_columns(cand.get("keputusan", []), sample_rows)
 
-            if fail_idx is None or pem_idx is None:
+            if not fail_cols or not pem_cols:
                 continue
 
             for rnum, cells in _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=None):
                 if rnum <= hdr_rnum:
                     continue
 
-                fail = cells.get(fail_idx)
-                pem = cells.get(pem_idx)
+                fail = _pick_from_cols(cells, fail_cols)
+                pem = _pick_from_cols(cells, pem_cols)
 
                 fail_str = clean_fail_no(fail)
                 pem_str = clean_str(pem)
@@ -1064,27 +1082,33 @@ def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]
                 if (is_nan(fail) or fail_str == "") and (is_nan(pem) or pem_str == ""):
                     continue
 
-                km_raw = cells.get(km_idx) if km_idx is not None else None
-                ut_raw = cells.get(ut_idx) if ut_idx is not None else None
-                jenis_raw = cells.get(jenis_idx) if jenis_idx is not None else None
+                mukim_val = _pick_from_cols(cells, mukim_cols) if mukim_cols else None
+                lot_val = _pick_from_cols(cells, lot_cols) if lot_cols else None
+                jenis_val = _pick_from_cols(cells, jenis_cols) if jenis_cols else None
+
+                km_raw = _pick_from_cols(cells, km_cols) if km_cols else None
+                ut_raw = _pick_from_cols(cells, ut_cols) if ut_cols else None
+                belum_val = _pick_from_cols(cells, belum_cols) if belum_cols else None
+                keputusan_val = _pick_from_cols(cells, keputusan_cols) if keputusan_cols else None
 
                 rec = {
                     "daerah": daerah_label,
                     "sheet": sheet_clean,
                     "fail_no_raw": normalize_osc_prefix(fail_str),
                     "pemohon": pem_str,
-                    "mukim": clean_str(cells.get(mukim_idx)) if mukim_idx is not None else "",
-                    "lot": clean_str(cells.get(lot_idx)) if lot_idx is not None else "",
-                    "jenis_row": clean_str(jenis_raw) if jenis_raw is not None else "",
-                    "km_date": parse_date_from_cell(km_raw) if km_idx is not None else None,
-                    "ut_date": parse_date_from_cell(ut_raw) if ut_idx is not None else None,
-                    "belum": clean_str(cells.get(belum_idx)) if belum_idx is not None else "",
-                    "keputusan": clean_str(cells.get(keputusan_idx)) if keputusan_idx is not None else "",
+                    "mukim": clean_str(mukim_val) if mukim_val is not None else "",
+                    "lot": clean_str(lot_val) if lot_val is not None else "",
+                    "jenis_row": clean_str(jenis_val) if jenis_val is not None else "",
+                    "km_date": parse_date_from_cell(km_raw) if km_raw is not None else None,
+                    "ut_date": parse_date_from_cell(ut_raw) if ut_raw is not None else None,
+                    "belum": clean_str(belum_val) if belum_val is not None else "",
+                    "keputusan": clean_str(keputusan_val) if keputusan_val is not None else "",
                     "induk_code": parse_induk_code(km_raw),
                 }
                 out.append(rec)
 
     return out
+
 
 @st.cache_data(show_spinner=False)
 def cached_read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]:
@@ -1276,7 +1300,6 @@ def build_categories(
                 if pc and pc not in UT_PRIMARY_ALLOWED:
                     continue
 
-                # SERENTAK special: old-format used induk_code; new-format uses primary_code
                 if g["sheet_u"] == "SERENTAK":
                     if pc:
                         if pc not in UT_PRIMARY_ALLOWED:
@@ -1862,7 +1885,7 @@ if gen:
                     "OCR agenda aktif?": "YA" if (agenda_enabled and enable_agenda_ocr) else "TIDAK",
                     "Sheet ditapis agenda": sorted(list(AGENDA_FILTER_SHEETS)),
                     "Rule tapisan agenda": "TAIL-BASED (No Unik Hujung) — PTJ dikecualikan",
-                    "Reader Excel": "ULTRA XML + AUTO PICK BEST COL (handle header lama+baru bercampur)",
+                    "Reader Excel": "ULTRA XML + ROBUST FALLBACK (handle duplicate header lama+baru)",
                     "UT filter": "Row-level Jenis Permohonan (PKM/BGN family sahaja; KTUP/204D/124A auto reject)",
                 })
 
