@@ -44,14 +44,14 @@ ALLOWED_SHEETS = {
     "KTUP",
     "JP",
     "LJUP",
-    # format baru biasanya ada banyak tab lain (Form Responses, etc) — kita ignore
 }
 
-# Tapisan agenda TERHAD (ikut keperluan OSC)
+# Tapisan agenda TERHAD (ikut arahan terbaru user)
+# NOTE: EV termasuk dalam cluster EVCB (kadang kertas maklumat guna "EV" sahaja).
 AGENDA_FILTER_SHEETS = {
     "SERENTAK",
     "PKM",
-    "TKR-GUNA",
+    "TKR-GUNA",        # termasuk variasi "TG" melalui canonical mapping
     "PKM TUKARGUNA",
     "BGN",
     "TELCO",
@@ -68,16 +68,11 @@ KNOWN_CODES = [
     "BGN", "EVCB", "EV", "TELCO",
 ]
 
-# Keluarga domain utk Lampiran G (ikut logik yang awak terangkan)
-UT_DOMAIN_ALLOWED = {"PKM", "TKR", "TKR-GUNA", "BGN", "EVCB", "EV", "TELCO"}
-KM_PB_DOMAIN = {"PKM", "TKR", "TKR-GUNA"}          # PB
-KM_BGN_DOMAIN = {"BGN", "EVCB", "EV", "TELCO"}     # BGN
-
 PB_CODES = {"PKM", "TKR-GUNA", "TKR", "124A", "204D", "PS", "SB", "CT"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
 
-# UT rules kekal (boleh refine lagi bila perlu)
+# UT rules kekal (boleh refine kemudian jika perlu)
 UT_ALLOWED_SHEETS = {"SERENTAK", "PKM", "BGN", "BGN EVCB", "TKR-GUNA", "PKM TUKARGUNA", "TKR"}
 SERENTAK_UT_ALLOWED_INDUK = {"PB", "PKM", "BGN"}
 
@@ -259,7 +254,6 @@ def parse_date_from_cell(val) -> Optional[dt.date]:
 
 
 def parse_induk_code(val) -> str:
-    # format lama kadang simpan "… (dd/mm/yyyy) PKM" etc
     if val is None or is_nan(val):
         return ""
     s = str(val).strip()
@@ -289,12 +283,21 @@ def sheet_norm(s: str) -> str:
 
 
 def canonical_sheet_name(sheet: str) -> str:
+    """
+    Canonicalize variasi nama sheet dalam excel supaya:
+    - "TG" dianggap "TKR-GUNA"
+    - "TKR GUNA" dianggap "TKR-GUNA"
+    - "PKM TUKAR GUNA" dianggap "PKM TUKARGUNA"
+    - "BGN-EVCB" dianggap "BGN EVCB"
+    - "E V" (jika ada spacing pelik) jadi "EV"
+    """
     s = sheet_norm(sheet)
     s = s.replace("_", " ")
     s = re.sub(r"\s+", " ", s).strip()
 
     if s in {"E V"}:
         return "EV"
+
     if s in {"TG", "TUKARGUNA", "TUKAR GUNA"}:
         return "TKR-GUNA"
     if s in {"TKR GUNA", "TKR-GUNA"}:
@@ -303,6 +306,7 @@ def canonical_sheet_name(sheet: str) -> str:
         return "PKM TUKARGUNA"
     if s in {"BGN-EVCB", "BGN EVCB"}:
         return "BGN EVCB"
+
     return s
 
 
@@ -344,6 +348,9 @@ def keputusan_is_empty(v) -> bool:
         return True
     if re.fullmatch(r"[-–—\s]+", s):
         return True
+    # Kalau ada tarikh dalam sel, kira "tak kosong"
+    if parse_date_from_cell(s) is not None:
+        return False
     return False
 
 
@@ -404,29 +411,11 @@ def extract_codes(fail_no: str, sheet_name: str) -> Set[str]:
     return codes
 
 
-def parse_row_primary_code(jenis_permohonan_cell: str) -> str:
-    """
-    Format baru: kolum Jenis Permohonan biasanya bagi satu kod utama setiap baris
-    contoh: 'PKM', 'KTUP', '204D (CT)', '204D (PS)', '204D (SB)', '124A', 'BGN', 'TELCO'
-    """
-    s = (jenis_permohonan_cell or "").upper().strip()
-    if not s:
-        return ""
-    # tangkap code utama
-    m = re.search(r"\b(204D|124A|PKM|BGN|KTUP|LJUP|JP|PL|PS|SB|CT|TKR\-GUNA|TKR|EVCB|EV|TELCO)\b", s)
-    if not m:
-        return ""
-    code = m.group(1)
-    # normalisasi variasi
-    if code in {"TKR GUNA"}:
-        return "TKR-GUNA"
-    return code
-
-
 def split_fail_induk(fail_no: str) -> str:
     s = normalize_osc_prefix(str(fail_no or "")).strip()
     if not s:
         return s
+    # buang suffix code lepas '-' terakhir yang mengandungi code
     for i in range(len(s) - 1, 0, -1):
         if s[i] == "-":
             suffix = s[i + 1:].upper()
@@ -699,7 +688,7 @@ def _parse_agenda_block(block_text: str) -> AgendaBlock:
         osc_heads=osc_heads,
         tails=tails,
         series_tail_keys=series_tail_keys,
-        pemohon_key=pemohon_norm(pem),
+        pemohon_key=pem_key,
         lot_set=lot_set,
         has_osc=has_osc,
     )
@@ -746,41 +735,35 @@ def parse_agenda_docx(file_bytes: bytes, enable_ocr: bool = False) -> AgendaInde
 
 
 # ============================================================
-# EXCEL READER (ULTRA FAST XML) + FIX MERGED CELLS (FORMAT BARU)
+# EXCEL READER (ULTRA FAST XML - AUTO PICK BEST COLUMN WHEN DUPLICATE HEADERS)
+# + SUPPORT FORMAT BARU: row-level "JENIS PERMOHONAN" (primary_code)
 # ============================================================
 HEADER_HINTS = [
     "No. Rujukan OSC",
-    "No Rujukan OSC",
     "No. Rujukan",
     "Rujukan OSC",
+    "No Fail Permohonan",
     "Pemaju",
     "Pemohon",
     "Daerah",
     "Mukim",
     "Lot",
     "Tempoh Untuk Proses",
-    "Tempoh Untuk diberi ulasan",
+    "Tempoh Untuk Diberi",
     "Tarikh Keputusan",
+    "Jabatan Induk / Teknikal",
+    "Belum memberi",
     "Jenis Permohonan",
 ]
 
 COL_CANDIDATES = {
-    "fail_no": [
-        "norujukanosc",
-        "no rujukan osc",
-        "rujukan osc",
-        "no rujukan",
-        "no.rujukanosc",
-        "norujukan",
-        "fail no",
-        "failno",
-    ],
+    "fail_no": ["norujukanosc", "no rujukan osc", "rujukan osc", "fail no", "failno", "no rujukan", "nofailpermohonan"],
     "pemohon": ["pemajupemohon", "pemaju/pemohon", "pemaju", "pemohon", "tetuan"],
     "mukim": ["mukimseksyen", "mukim/seksyen", "mukim", "seksyen"],
     "lot": ["lot"],
-    "jenis_permohonan": ["jenispermohonan"],
+    "jenis_perm": ["jenispermohonan"],
     "km": ["tempohuntukprosesolehjabataninduk", "tempohuntukproses"],
-    "ut": ["tempohuntukdiberiulasanolehjabatanteknikal", "tempohuntukdiberiulasan", "tempohuntukdiberiulasanolehjabatan"],
+    "ut": ["tempohuntukdiberiulasanolehjabatanteknikal", "tempohuntukdiberiulasan"],
     "belum": ["jabatanindukteknikalygbelummemberikeputusanulasansehinggakini", "belummemberikeputusanulasan", "ygbelummemberikeputusan", "belummemberi"],
     "keputusan": ["tarikhkeputusankuasa", "tarikhkeputusan"],
 }
@@ -788,14 +771,12 @@ COL_CANDIDATES = {
 _NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _NS_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
-
 def norm_basic(s: str) -> str:
     s = "" if s is None else str(s)
     s = s.strip().lower()
     s = re.sub(r"[\s\r\n\t]+", " ", s)
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
-
 
 def _col_letters_to_index(col_letters: str) -> int:
     col_letters = col_letters.upper()
@@ -805,9 +786,7 @@ def _col_letters_to_index(col_letters: str) -> int:
             n = n * 26 + (ord(ch) - ord("A") + 1)
     return n - 1
 
-
 _CELL_REF_RE = re.compile(r"^([A-Z]+)(\d+)$")
-
 
 def _cell_ref_to_col_idx(cell_ref: str) -> Optional[int]:
     if not cell_ref:
@@ -816,7 +795,6 @@ def _cell_ref_to_col_idx(cell_ref: str) -> Optional[int]:
     if not m:
         return None
     return _col_letters_to_index(m.group(1))
-
 
 def _load_shared_strings(z: zipfile.ZipFile) -> List[str]:
     path = "xl/sharedStrings.xml"
@@ -832,7 +810,6 @@ def _load_shared_strings(z: zipfile.ZipFile) -> List[str]:
                 texts.append(t.text)
         out.append("".join(texts))
     return out
-
 
 def _workbook_sheet_paths(z: zipfile.ZipFile) -> List[Tuple[str, str]]:
     wb_xml = z.read("xl/workbook.xml")
@@ -863,7 +840,6 @@ def _workbook_sheet_paths(z: zipfile.ZipFile) -> List[Tuple[str, str]]:
             out.append((name, target))
     return out
 
-
 def _cell_value_from_c_el(c_el: ET.Element, shared_strings: List[str]) -> Optional[object]:
     t = c_el.attrib.get("t", "")
     v_el = c_el.find(f"{_NS_MAIN}v")
@@ -883,7 +859,6 @@ def _cell_value_from_c_el(c_el: ET.Element, shared_strings: List[str]) -> Option
         return None
 
     raw = v_el.text
-
     if t == "s":
         try:
             idx = int(raw)
@@ -911,7 +886,6 @@ def _cell_value_from_c_el(c_el: ET.Element, shared_strings: List[str]) -> Option
             return s
     return s
 
-
 def _iter_sheet_rows_cells(
     z: zipfile.ZipFile,
     sheet_path: str,
@@ -923,7 +897,7 @@ def _iter_sheet_rows_cells(
     with z.open(sheet_path) as f:
         context = ET.iterparse(f, events=("end",))
         yielded = 0
-        for event, elem in context:
+        for _, elem in context:
             if elem.tag == f"{_NS_MAIN}row":
                 r_attr = elem.attrib.get("r", "")
                 try:
@@ -950,7 +924,6 @@ def _iter_sheet_rows_cells(
 
                 elem.clear()
 
-
 def _row_cells_to_list(cells: Dict[int, object]) -> List[object]:
     if not cells:
         return []
@@ -960,14 +933,12 @@ def _row_cells_to_list(cells: Dict[int, object]) -> List[object]:
         out[k] = v
     return out
 
-
 def _header_score(joined_lower: str) -> int:
     score = 0
     for h in HEADER_HINTS:
         if h.lower() in joined_lower:
             score += 1
     return score
-
 
 def _find_header_row_ultra(rows_iter) -> Tuple[Optional[int], Optional[List[object]]]:
     best_r = None
@@ -989,26 +960,56 @@ def _find_header_row_ultra(rows_iter) -> Tuple[Optional[int], Optional[List[obje
         return None, None
     return best_r, best_vals
 
-
-def _detect_columns_ultra(header_vals: List[object]) -> Dict[str, int]:
+def _detect_columns_candidates(header_vals: List[object]) -> Dict[str, List[int]]:
     norm_cols = [norm_basic(x) for x in header_vals]
-    found: Dict[str, int] = {}
+    cand: Dict[str, List[int]] = {k: [] for k in COL_CANDIDATES.keys()}
+
     for key, needles in COL_CANDIDATES.items():
-        for needle in needles:
-            for idx, ncol in enumerate(norm_cols):
-                if needle in ncol:
-                    found[key] = idx
+        for idx, ncol in enumerate(norm_cols):
+            for needle in needles:
+                if needle and needle in ncol:
+                    cand[key].append(idx)
                     break
-            if key in found:
-                break
-    return found
+    return cand
 
+def _is_nonempty(v) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "" or s.lower() == "nan":
+            return False
+    return True
 
-def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str, source_tag: str) -> List[dict]:
-    """
-    Ultra-fast reader for bloated XLSX (Google Sheets export pun laju)
-    + FIX FORMAT BARU: merged-cells create "baris 2 kosong" → auto fill-down
-    """
+def _is_code_like(v) -> bool:
+    if not _is_nonempty(v):
+        return False
+    s = str(v).upper()
+    return bool(re.search(r"\b(PKM|TKR|TKR[-\s]?GUNA|124A|204D|PS|SB|CT|KTUP|LJUP|JP|PL|BGN|EVCB|EV|TELCO)\b", s))
+
+def _pick_best_column(cand_idxs: List[int], sample_rows: List[Dict[int, object]], prefer_code: bool = False) -> Optional[int]:
+    if not cand_idxs:
+        return None
+    best_idx = None
+    best_score = -1
+    for idx in cand_idxs:
+        score = 0
+        for cells in sample_rows:
+            v = cells.get(idx)
+            if prefer_code:
+                if _is_code_like(v):
+                    score += 3
+                elif _is_nonempty(v):
+                    score += 1
+            else:
+                if _is_nonempty(v):
+                    score += 1
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    return best_idx if best_score > 0 else cand_idxs[0]
+
+def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]:
     out: List[dict] = []
     allowed_upper = {s.upper() for s in ALLOWED_SHEETS}
 
@@ -1021,161 +1022,107 @@ def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str, source_tag: s
             if sheet_clean.upper() not in allowed_upper:
                 continue
 
-            scan_iter = _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=140)
+            scan_iter = _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=200)
             hdr_rnum, hdr_vals = _find_header_row_ultra(scan_iter)
             if hdr_rnum is None or hdr_vals is None:
                 continue
 
-            cols = _detect_columns_ultra(hdr_vals)
-            if "fail_no" not in cols:
+            cand = _detect_columns_candidates(hdr_vals)
+
+            # sample rows untuk resolve duplicate header (format lama + baru dalam satu sheet)
+            sample_rows: List[Dict[int, object]] = []
+            for rnum, cells in _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=None):
+                if rnum <= hdr_rnum:
+                    continue
+                sample_rows.append(cells)
+                if len(sample_rows) >= 60:
+                    break
+
+            fail_idx = _pick_best_column(cand.get("fail_no", []), sample_rows)
+            pem_idx = _pick_best_column(cand.get("pemohon", []), sample_rows)
+            mukim_idx = _pick_best_column(cand.get("mukim", []), sample_rows)
+            lot_idx = _pick_best_column(cand.get("lot", []), sample_rows)
+            jenis_idx = _pick_best_column(cand.get("jenis_perm", []), sample_rows, prefer_code=True)
+            km_idx = _pick_best_column(cand.get("km", []), sample_rows)
+            ut_idx = _pick_best_column(cand.get("ut", []), sample_rows)
+            belum_idx = _pick_best_column(cand.get("belum", []), sample_rows)
+            keputusan_idx = _pick_best_column(cand.get("keputusan", []), sample_rows)
+
+            if fail_idx is None or pem_idx is None:
                 continue
-
-            fail_idx = cols.get("fail_no")
-            pem_idx = cols.get("pemohon")
-            mukim_idx = cols.get("mukim")
-            lot_idx = cols.get("lot")
-            jenis_idx = cols.get("jenis_permohonan")
-            km_idx = cols.get("km")
-            ut_idx = cols.get("ut")
-            belum_idx = cols.get("belum")
-            keputusan_idx = cols.get("keputusan")
-
-            # last seen values to repair merged blanks (format baru)
-            last_seen: Dict[str, object] = {
-                "fail_no": "",
-                "pemohon": "",
-                "mukim": "",
-                "lot": "",
-                "km_raw": None,
-                "ut_raw": None,
-            }
 
             for rnum, cells in _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=None):
                 if rnum <= hdr_rnum:
                     continue
 
-                fail_raw = cells.get(fail_idx) if fail_idx is not None else None
-                pem_raw = cells.get(pem_idx) if pem_idx is not None else None
-                mukim_raw = cells.get(mukim_idx) if mukim_idx is not None else None
-                lot_raw = cells.get(lot_idx) if lot_idx is not None else None
-                jenis_raw = cells.get(jenis_idx) if jenis_idx is not None else None
+                fail = cells.get(fail_idx)
+                pem = cells.get(pem_idx)
+
+                fail_str = clean_fail_no(fail)
+                pem_str = clean_str(pem)
+
+                if (is_nan(fail) or fail_str == "") and (is_nan(pem) or pem_str == ""):
+                    continue
+
                 km_raw = cells.get(km_idx) if km_idx is not None else None
                 ut_raw = cells.get(ut_idx) if ut_idx is not None else None
-                belum_raw = cells.get(belum_idx) if belum_idx is not None else None
-                keputusan_raw = cells.get(keputusan_idx) if keputusan_idx is not None else None
-
-                fail_str = clean_fail_no(fail_raw)
-                pem_str = clean_str(pem_raw)
-                mukim_str = clean_str(mukim_raw)
-                lot_str = clean_str(lot_raw)
-                jenis_str = clean_str(jenis_raw)
-
-                # ====== FIX MERGED CELLS (format baru) ======
-                # jika baris ada Jenis Permohonan (PKM/KTUP/204D/etc) tetapi sel lain kosong,
-                # ambil dari last_seen (baris atas) supaya info pemaju/lot tidak hilang.
-                if fail_str == "" and jenis_str:
-                    prev_fail = clean_fail_no(last_seen.get("fail_no"))
-                    if prev_fail:
-                        fail_str = prev_fail
-
-                if pem_str == "" and jenis_str:
-                    prev_pem = clean_str(last_seen.get("pemohon"))
-                    if prev_pem:
-                        pem_str = prev_pem
-
-                if mukim_str == "" and jenis_str:
-                    prev_mk = clean_str(last_seen.get("mukim"))
-                    if prev_mk:
-                        mukim_str = prev_mk
-
-                if lot_str == "" and jenis_str:
-                    prev_lot = clean_str(last_seen.get("lot"))
-                    if prev_lot:
-                        lot_str = prev_lot
-
-                # km/ut pun kadang merged
-                if km_raw is None and jenis_str and last_seen.get("km_raw") is not None:
-                    km_raw = last_seen.get("km_raw")
-                if ut_raw is None and jenis_str and last_seen.get("ut_raw") is not None:
-                    ut_raw = last_seen.get("ut_raw")
-
-                # update last seen bila jumpa nilai
-                if fail_str:
-                    last_seen["fail_no"] = fail_str
-                if pem_str:
-                    last_seen["pemohon"] = pem_str
-                if mukim_str:
-                    last_seen["mukim"] = mukim_str
-                if lot_str:
-                    last_seen["lot"] = lot_str
-                if km_raw is not None:
-                    last_seen["km_raw"] = km_raw
-                if ut_raw is not None:
-                    last_seen["ut_raw"] = ut_raw
-                # ===========================================
-
-                if fail_str == "" and pem_str == "":
-                    continue
+                jenis_raw = cells.get(jenis_idx) if jenis_idx is not None else None
 
                 rec = {
                     "daerah": daerah_label,
                     "sheet": sheet_clean,
-                    "source_tag": source_tag,   # untuk debug / dedup
-                    "rownum": rnum,
                     "fail_no_raw": normalize_osc_prefix(fail_str),
                     "pemohon": pem_str,
-                    "mukim": mukim_str,
-                    "lot": lot_str,
-                    "jenis_permohonan_cell": jenis_str,
+                    "mukim": clean_str(cells.get(mukim_idx)) if mukim_idx is not None else "",
+                    "lot": clean_str(cells.get(lot_idx)) if lot_idx is not None else "",
+                    "jenis_row": clean_str(jenis_raw) if jenis_raw is not None else "",
                     "km_date": parse_date_from_cell(km_raw) if km_idx is not None else None,
                     "ut_date": parse_date_from_cell(ut_raw) if ut_idx is not None else None,
-                    "belum": clean_str(belum_raw),
-                    "keputusan": clean_str(keputusan_raw),
-                    "induk_code": parse_induk_code(km_raw),  # format baru mungkin kosong, ok
+                    "belum": clean_str(cells.get(belum_idx)) if belum_idx is not None else "",
+                    "keputusan": clean_str(cells.get(keputusan_idx)) if keputusan_idx is not None else "",
+                    "induk_code": parse_induk_code(km_raw),
                 }
                 out.append(rec)
 
     return out
 
-
 @st.cache_data(show_spinner=False)
-def cached_read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str, source_tag: str) -> List[dict]:
-    return read_kertas_excel_ultra(excel_bytes, daerah_label, source_tag)
+def cached_read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]:
+    return read_kertas_excel_ultra(excel_bytes, daerah_label)
 
 
 # ============================================================
-# ENRICH & DOMAIN RULES (FORMAT LAMA + BARU)
+# BUILD CATEGORIES (support primary_code from format baru)
 # ============================================================
+def parse_primary_code(jenis_row: str, sheet_u: str) -> str:
+    s = (jenis_row or "").upper().strip()
+    if s:
+        s = s.replace("TKR GUNA", "TKR-GUNA")
+        m = re.search(r"\b(TKR-GUNA|PKM|TKR|124A|204D|PS|SB|CT|KTUP|LJUP|JP|PL|BGN|EVCB|EV|TELCO)\b", s)
+        if m:
+            return m.group(1)
+
+    su = canonical_sheet_name(sheet_u).upper()
+    if su in {"PKM", "TKR", "TKR-GUNA", "KTUP", "JP", "LJUP", "PL", "PS", "SB", "CT", "EVCB", "EV", "TELCO", "BGN"}:
+        return su
+    if su in {"PKM TUKARGUNA"}:
+        return "TKR-GUNA"
+    return ""
+
+
 def enrich_rows(rows: List[dict]) -> List[dict]:
     out = []
     for r in rows:
         rr = dict(r)
         rr["sheet_u"] = canonical_sheet_name(r["sheet"])
+        rr["codes"] = extract_codes(r["fail_no_raw"], rr["sheet_u"])
+        rr["primary_code"] = parse_primary_code(r.get("jenis_row", ""), rr["sheet_u"])
+        rr["serentak"] = is_serentak(rr["sheet_u"], r["fail_no_raw"])
+        rr["fail_induk"] = split_fail_induk(r["fail_no_raw"])
 
-        # row primary code (format baru)
-        rr["row_code"] = parse_row_primary_code(r.get("jenis_permohonan_cell", ""))
-
-        # codes union: fail_no + sheet implied + row_code
-        codes = extract_codes(r.get("fail_no_raw", ""), rr["sheet_u"])
-        if rr["row_code"]:
-            codes.add(rr["row_code"])
-
-            # khas 204D(PS/SB/CT): letak juga family kecil kalau ada dalam string
-            s = (r.get("jenis_permohonan_cell") or "").upper()
-            if "PS" in s:
-                codes.add("PS")
-            if "SB" in s:
-                codes.add("SB")
-            if "CT" in s:
-                codes.add("CT")
-
-        rr["codes"] = codes
-        rr["serentak"] = is_serentak(rr["sheet_u"], r.get("fail_no_raw", ""))
-        rr["fail_induk"] = split_fail_induk(r.get("fail_no_raw", ""))
-
-        rr["tail"] = extract_tail_only(r.get("fail_no_raw", ""))
-        rr["series_tail"] = extract_series_tail_key(r.get("fail_no_raw", ""))
-        rr["osc_head_norm"] = osc_norm(extract_osc_head(r.get("fail_no_raw", "")))
+        rr["tail"] = extract_tail_only(r["fail_no_raw"])
+        rr["series_tail"] = extract_series_tail_key(r["fail_no_raw"])
+        rr["osc_head_norm"] = osc_norm(extract_osc_head(r["fail_no_raw"]))
 
         rr["pemohon_key"] = pemohon_norm(r.get("pemohon", ""))
         rr["lot_set"] = lot_tokens(r.get("lot", ""))
@@ -1192,23 +1139,6 @@ def sheet_is_ut_allowed(sheet_u: str) -> bool:
     return False
 
 
-def row_is_ut_domain(r: dict) -> bool:
-    """
-    Penentu kategori UT:
-    - format baru: STRICT ikut row_code
-    - format lama: ikut codes/sheet
-    """
-    rc = (r.get("row_code") or "").upper().strip()
-    if rc:
-        return rc in UT_DOMAIN_ALLOWED
-    # fallback format lama
-    codes = set(r.get("codes") or set())
-    return bool(codes & UT_DOMAIN_ALLOWED)
-
-
-# ============================================================
-# AGENDA MATCHING (tail + fallback pemohon+lot)
-# ============================================================
 def _agenda_fallback_match(row: dict, agenda: "AgendaIndex") -> bool:
     if row["sheet_u"] not in AGENDA_FILTER_SHEETS:
         return False
@@ -1243,9 +1173,6 @@ def _agenda_fallback_match(row: dict, agenda: "AgendaIndex") -> bool:
     return False
 
 
-# ============================================================
-# BUILD CATEGORIES
-# ============================================================
 def build_categories(
     rows: List[dict],
     agenda: Optional["AgendaIndex"],
@@ -1259,7 +1186,6 @@ def build_categories(
 
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
-    # tapisan agenda (buang yang dah dalam agenda) — only untuk sheet tertentu
     if agenda_enabled and agenda:
         def _keep(r: dict) -> bool:
             if r["sheet_u"] not in AGENDA_FILTER_SHEETS:
@@ -1277,7 +1203,6 @@ def build_categories(
 
         rows = [r for r in rows if _keep(r)]
 
-    # group by fail_induk (serentak)
     by_induk: Dict[str, List[dict]] = {}
     for r in rows:
         by_induk.setdefault(r["fail_induk"], []).append(r)
@@ -1299,6 +1224,10 @@ def build_categories(
             "dedup_key": f"{cat}|{tindakan}|{osc_norm(fail_no)}|{nama_simplify(base_r['pemohon'])}|{extra_key}",
         }
 
+    # UT (Kategori 2) allowed by row-level primary_code (format baru)
+    UT_PRIMARY_ALLOWED = {"PKM", "TKR", "TKR-GUNA", "BGN", "EVCB", "EV", "TELCO"}
+    UT_PRIMARY_DISALLOWED = {"KTUP", "LJUP", "JP", "PL", "PS", "SB", "CT", "204D", "124A"}
+
     cat1, cat2, cat3, cat4, cat5 = [], [], [], [], []
 
     for induk, grp in by_induk.items():
@@ -1315,30 +1244,23 @@ def build_categories(
         jenis_ser = (f"{codes_join} (Serentak)".strip() if codes_join else "(Serentak)").strip()
         fail_no_ser = f"{induk}-{codes_join}" if codes_join else induk
 
-        # =============================
-        # KATEGORI 1 — KM (PB + BGN)
-        # =============================
+        # KATEGORI 1 — KM
         if is_ser and in_range(km_date, km_start, km_end):
-            # PB: hanya jika ada keluarga PKM/TKR (bukan PS/SB/CT)
-            if union_codes & KM_PB_DOMAIN:
+            if union_codes & (PB_CODES - {"PS", "SB", "CT"}):
                 cat1.append(make_rec(1, "Pengarah Perancang Bandar", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-PB"))
-            # BGN: jika ada keluarga BGN
-            if union_codes & KM_BGN_DOMAIN:
+            if union_codes & {"BGN", "EVCB", "EV", "TELCO"}:
                 cat1.append(make_rec(1, "Pengarah Bangunan", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-BGN"))
 
         if not is_ser:
             for g in grp:
                 if not in_range(g.get("km_date"), km_start, km_end):
                     continue
-                codes = set(g.get("codes") or set())
-                if codes & KM_PB_DOMAIN:
+                if g["codes"] & {"PKM", "TKR", "TKR-GUNA"}:
                     cat1.append(make_rec(1, "Pengarah Perancang Bandar", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-PB"))
-                if codes & KM_BGN_DOMAIN:
+                if g["codes"] & {"BGN", "EVCB", "EV", "TELCO"}:
                     cat1.append(make_rec(1, "Pengarah Bangunan", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-BGN"))
 
-        # =============================
-        # KATEGORI 2 — UT (STRICT ikut row_code utk format baru)
-        # =============================
+        # KATEGORI 2 — UT (row-level filter by primary_code)
         if ut_enabled:
             for g in grp:
                 if not sheet_is_ut_allowed(g["sheet_u"]):
@@ -1348,16 +1270,22 @@ def build_categories(
                 if is_blankish_text(g.get("belum")):
                     continue
 
-                # ====== PENTING: FILTER DOMAIN UT ======
-                # format baru: jika row_code = KTUP/204D/124A → confirm tak masuk kategori 2
-                if not row_is_ut_domain(g):
+                pc = (g.get("primary_code") or "").upper().strip()
+                if pc in UT_PRIMARY_DISALLOWED:
+                    continue
+                if pc and pc not in UT_PRIMARY_ALLOWED:
                     continue
 
-                # SERENTAK UT restriction lama: hanya apply bila induk_code wujud
+                # SERENTAK special: old-format used induk_code; new-format uses primary_code
                 if g["sheet_u"] == "SERENTAK":
-                    ic = (g.get("induk_code") or "").strip().upper()
-                    if ic and (ic not in SERENTAK_UT_ALLOWED_INDUK):
-                        continue
+                    if pc:
+                        if pc not in UT_PRIMARY_ALLOWED:
+                            continue
+                    else:
+                        if (g.get("induk_code") or "") and (g.get("induk_code") not in SERENTAK_UT_ALLOWED_INDUK):
+                            continue
+                        if not (set(g.get("codes") or set()) & UT_PRIMARY_ALLOWED):
+                            continue
 
                 tindakan = tindakan_ut(g.get("belum", ""))
                 if is_blankish_text(tindakan):
@@ -1367,12 +1295,10 @@ def build_categories(
                 jenis = jenis_ser if is_ser else g["sheet_u"]
                 fail_no = fail_no_ser if is_ser else g["fail_no_raw"]
 
-                extra_key = f"{g['sheet_u']}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}|RC:{g.get('row_code','')}"
+                extra_key = f"{g['sheet_u']}|{pc}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
                 cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, extra_key))
 
-        # =============================
         # KATEGORI 3/4/5 — KM
-        # =============================
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & KEJ_CODES:
                 cat3.append(make_rec(3, "Pengarah Kejuruteraan", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-KEJ"))
@@ -1875,17 +1801,17 @@ if gen:
             # --- ULTRA FAST PARALLEL READ (SPU/SPS/SPT) ---
             rows: List[dict] = []
 
-            def _read_one_bytes(b: bytes, daerah: str, tag: str) -> List[dict]:
-                return cached_read_kertas_excel_ultra(b, daerah, tag)
+            def _read_one_bytes(b: bytes, daerah: str) -> List[dict]:
+                return cached_read_kertas_excel_ultra(b, daerah)
 
             tasks = []
             with ThreadPoolExecutor(max_workers=6) as ex:
-                for idx, f in enumerate(spu_files, start=1):
-                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPU", f"SPU#{idx}"))
-                for idx, f in enumerate(sps_files, start=1):
-                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPS", f"SPS#{idx}"))
-                for idx, f in enumerate(spt_files, start=1):
-                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPT", f"SPT#{idx}"))
+                for f in spu_files:
+                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPU"))
+                for f in sps_files:
+                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPS"))
+                for f in spt_files:
+                    tasks.append(ex.submit(_read_one_bytes, f.getvalue(), "SPT"))
 
                 for fut in as_completed(tasks):
                     rows += fut.result()
@@ -1934,7 +1860,10 @@ if gen:
                     "Kategori 5": len(cat5),
                     "Agenda digunakan?": "YA" if agenda_enabled else "TIDAK (Teruskan tanpa Agenda)",
                     "OCR agenda aktif?": "YA" if (agenda_enabled and enable_agenda_ocr) else "TIDAK",
-                    "Reader Excel": "ULTRA XML + FIX MERGED CELLS (format baru) + STRICT row_code untuk UT",
+                    "Sheet ditapis agenda": sorted(list(AGENDA_FILTER_SHEETS)),
+                    "Rule tapisan agenda": "TAIL-BASED (No Unik Hujung) — PTJ dikecualikan",
+                    "Reader Excel": "ULTRA XML + AUTO PICK BEST COL (handle header lama+baru bercampur)",
+                    "UT filter": "Row-level Jenis Permohonan (PKM/BGN family sahaja; KTUP/204D/124A auto reject)",
                 })
 
     except Exception as e:
