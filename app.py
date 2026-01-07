@@ -489,10 +489,203 @@ def extract_jenis_from_fail_no_display(fail_no_display: str) -> str:
 # ============================================================
 _ROMAN = {"i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","xiii","xiv","xv","xvi","xvii","xviii","xix","xx"}
 
+
+# ---------------------------
+# PEMAJU/PEMOHON (AKRONIM) — UPGRADED
+# ---------------------------
+# Prinsip:
+# 1) Buat Proper Case untuk perkataan biasa.
+# 2) Kekalkan AKRONIM sebagai ALL CAPS bila memang "rupa akronim" (contoh ABIM, JMG, PDC, CEO, KFC, SKMM, dll).
+# 3) Jangan salah anggap singkatan korporat biasa sebagai akronim (contoh SDN BHD -> "Sdn Bhd", BUKAN "SDN BHD").
+# 4) Hormat input asal: jika token memang ALL CAPS dan memenuhi ciri akronim, kekalkan ALL CAPS,
+#    kecuali token dalam senarai "bukan akronim".
+_PEMOHON_FORCE_TITLE = {
+    "SDN": "Sdn",
+    "BHD": "Bhd",
+    "BERHAD": "Berhad",
+    "ENTERPRISE": "Enterprise",
+    "ENTERPRISES": "Enterprises",
+    "TRADING": "Trading",
+    "HOLDINGS": "Holdings",
+    "GROUP": "Group",
+    "INDUSTRIES": "Industries",
+    "INDUSTRY": "Industry",
+    "COMPANY": "Company",
+    "CO": "Co",
+    "CO.": "Co.",
+    "LIMITED": "Limited",
+    "LTD": "Ltd",
+    "LTD.": "Ltd.",
+}
+
+# Singkatan yang patut kekal uppercase (ini bukan "ayat biasa", tapi memang standard ditulis uppercase)
+_PEMOHON_FORCE_UPPER = {
+    "LLP", "PLC", "PLT",
+    "MBSP", "OSC",
+    "JK", "TNB", "TM",
+    # contoh umum yang user sebut / biasa jumpa
+    "CEO", "KFC", "PDC", "ABIM", "JMG", "JAS", "SKMM", "JKR", "JPS", "IWK",
+    "JPJ", "PDRM",
+}
+
+# Token yang "nampak uppercase" tetapi BUKAN akronim untuk dikekalkan uppercase
+# (jadi kita akan jatuhkan ke Proper Case mengikut peta di atas)
+_PEMOHON_NOT_ACRONYM_UPPER = {
+    "SDN", "BHD", "BERHAD", "LTD", "LTD.", "CO", "CO.", "ENTERPRISE", "ENTERPRISES",
+    "TRADING", "HOLDINGS", "GROUP", "INDUSTRIES", "INDUSTRY", "COMPANY",
+}
+
+def _cap_word_basic(w: str) -> str:
+    """
+    Proper-case yang selamat:
+    - sokong apostrophe: O'Connor
+    - jangan ubah nombor
+    """
+    if not w:
+        return w
+    if w.isdigit():
+        return w
+    parts = w.split("'")
+    parts2 = []
+    for p in parts:
+        if not p:
+            parts2.append(p)
+        else:
+            parts2.append(p.lower().capitalize())
+    return "'".join(parts2)
+
+def _looks_like_dotted_acronym(core: str) -> bool:
+    # Contoh: S.K.M.M, J.P.S., A.B, etc
+    return bool(re.fullmatch(r"(?:[A-Za-z]\.){2,}[A-Za-z]?\.*", core))
+
+def _normalize_dotted_acronym(core: str) -> str:
+    letters = re.findall(r"[A-Za-z]", core)
+    if len(letters) >= 2:
+        return "".join(letters).upper()
+    return core
+
+def _is_acronym_candidate(core_clean: str, core_original: str) -> bool:
+    """
+    Heuristik AKRONIM:
+    - core_original ALL CAPS (atau majoriti CAPS) + panjang munasabah (2..10)
+    - atau core ialah campuran huruf+angka tetapi jelas style akronim (contoh P3C, JKR2)
+    - dan BUKAN token korporat biasa (SDN/BHD/etc)
+    """
+    if not core_clean:
+        return False
+
+    up_clean = core_clean.upper()
+
+    # forced sets
+    if up_clean in _PEMOHON_FORCE_UPPER:
+        return True
+    if up_clean in _PEMOHON_NOT_ACRONYM_UPPER:
+        return False
+
+    # dotted acronyms handled separately
+    if _looks_like_dotted_acronym(core_original):
+        return True
+
+    # pure letters
+    if core_clean.isalpha():
+        # jika input asal memang ALL CAPS, treat as akronim (cth ABIM, JMG, CEO)
+        if re.fullmatch(r"[A-Z]{2,10}", core_original):
+            return True
+        # juga jika token memang nampak "akronim sebut huruf" (2-6 huruf) dan asal sekurang-kurangnya 2 huruf besar
+        if 2 <= len(core_clean) <= 8:
+            caps = sum(1 for ch in core_original if "A" <= ch <= "Z")
+            if caps >= 2 and core_original.upper() == core_original:
+                return True
+        return False
+
+    # letters+digits: jika asal uppercase/digit dan ada >=2 huruf
+    if re.fullmatch(r"[A-Za-z0-9]{2,12}", core_clean):
+        letters = sum(1 for ch in core_clean if ch.isalpha())
+        if letters >= 2 and re.fullmatch(r"[A-Z0-9]{2,12}", core_original):
+            return True
+
+    return False
+
+def _transform_token_preserve_punct(tok: str) -> str:
+    """
+    Transform satu token (tanpa whitespace) sambil preserve punctuation luar:
+    contoh "(ABIM)" -> "(ABIM)", "SDN." -> "Sdn."
+    """
+    if not tok:
+        return tok
+
+    m = re.match(r"^([^A-Za-z0-9]*)(.*?)([^A-Za-z0-9]*)$", tok)
+    if not m:
+        return tok
+    pre, core, suf = m.group(1), m.group(2), m.group(3)
+    if not core:
+        return tok
+
+    # Handle dotted acronym: S.K.M.M / J.P.S.
+    if _looks_like_dotted_acronym(core):
+        return pre + _normalize_dotted_acronym(core) + suf
+
+    # Handle single-letter & pattern: M&E, T&C (kekalkan uppercase huruf sekitar &)
+    # NOTE: kalau ada ruang, ia akan dipecahkan di peringkat lebih luar; ini cover token rapat.
+    if re.fullmatch(r"[A-Za-z]\&[A-Za-z]", core):
+        return pre + f"{core[0].upper()}&{core[2].upper()}" + suf
+
+    # Pecah ikut '-' '/' supaya "ABC-TRADING" proses setiap segmen (tanpa buang separator)
+    parts = re.split(r"([\-\/])", core)
+    out_parts: List[str] = []
+    for p in parts:
+        if p in {"-", "/"}:
+            out_parts.append(p)
+            continue
+        if p == "":
+            out_parts.append(p)
+            continue
+
+        # strip punctuation dalam segmen (cth "BHD." sudah disapu oleh suf, tapi "CO." kadang duduk di tengah)
+        p2 = p
+        p_pre = ""
+        p_suf = ""
+        mm = re.match(r"^([^A-Za-z0-9]*)(.*?)([^A-Za-z0-9]*)$", p2)
+        if mm:
+            p_pre, p_core, p_suf = mm.group(1), mm.group(2), mm.group(3)
+        else:
+            p_core = p2
+
+        if not p_core:
+            out_parts.append(p_pre + p_core + p_suf)
+            continue
+
+        up = p_core.upper()
+        # Force Title tokens (Sdn/Bhd/Berhad/etc)
+        if up in _PEMOHON_FORCE_TITLE:
+            out_parts.append(p_pre + _PEMOHON_FORCE_TITLE[up] + p_suf)
+            continue
+        # Force Upper tokens
+        if up in _PEMOHON_FORCE_UPPER:
+            out_parts.append(p_pre + up + p_suf)
+            continue
+
+        # Roman numerals
+        if p_core.lower() in _ROMAN:
+            out_parts.append(p_pre + p_core.upper() + p_suf)
+            continue
+
+        # Acronym heuristic (based on original casing)
+        core_clean = re.sub(r"[^A-Za-z0-9]", "", p_core)
+        if _is_acronym_candidate(core_clean, p_core):
+            out_parts.append(p_pre + core_clean.upper() + p_suf)
+            continue
+
+        # Otherwise proper-case normal words (support apostrophe)
+        out_parts.append(p_pre + _cap_word_basic(p_core) + p_suf)
+
+    return pre + "".join(out_parts) + suf
+
 def format_pemohon_display(name: str) -> str:
     """
     Convert casing kepada 'Proper Case' untuk output Lampiran G,
-    dengan pengecualian token korporat & akronim tertentu.
+    dengan heuristik AKRONIM yang lebih bijak (contoh CEO/KFC/PDC/ABIM/JMG/JAS/SKMM...)
+    dan elak salah uppercase untuk singkatan korporat biasa (Sdn Bhd).
     """
     if is_blankish_text(name):
         return ""
@@ -500,43 +693,26 @@ def format_pemohon_display(name: str) -> str:
     s = str(name).strip()
     s = re.sub(r"[\r\n\t]+", " ", s)
     s = re.sub(r"\s{2,}", " ", s).strip()
+    if not s:
+        return ""
 
-    # Title-case setiap chunk huruf
-    base = re.sub(r"[A-Za-zÀ-ÿ]+", lambda m: m.group(0).lower().capitalize(), s)
+    # Pecah ikut whitespace, preserve spasi supaya format asal tak berterabur
+    chunks = re.split(r"(\s+)", s)
+    out_chunks: List[str] = []
+    for ch in chunks:
+        if ch.isspace() or ch == "":
+            out_chunks.append(ch)
+            continue
+        out_chunks.append(_transform_token_preserve_punct(ch))
 
-    # Fix common corp tokens & acronyms (Sdn Bhd kekal betul, BUKAN akronim)
-    repl = {
-        r"\bSdn\b": "Sdn",
-        r"\bBhd\b": "Bhd",
-        r"\bBerhad\b": "Berhad",
-        r"\bEnterprise\b": "Enterprise",
-        r"\bEnterprises\b": "Enterprises",
-        r"\bLlp\b": "LLP",
-        r"\bPlc\b": "PLC",
-        r"\bPlt\b": "PLT",
-        r"\bMbsp\b": "MBSP",
-        r"\bOsc\b": "OSC",
-        r"\bJk\b": "JK",
-        r"\bTnb\b": "TNB",
-        r"\bTm\b": "TM",
-    }
-    out = base
-    for pat, rep in repl.items():
-        out = re.sub(pat, rep, out)
+    out = "".join(out_chunks)
 
-    # Roman numerals -> uppercase
-    def _roman_fix(m):
-        w = m.group(0)
-        if w.lower() in _ROMAN:
-            return w.upper()
-        return w
-
-    out = re.sub(r"\b[IVXLCDMivxlcdm]{1,6}\b", _roman_fix, out)
-
-    # Handle patterns like "M&E" / "T&C" -> uppercase letters around &
-    out = re.sub(r"\b([A-Za-z])\s*&\s*([A-Za-z])\b", lambda m: f"{m.group(1).upper()}&{m.group(2).upper()}", out)
-
+    # Final tidy:
     out = re.sub(r"\s{2,}", " ", out).strip()
+
+    # Extra normalize: "Sdn. Bhd." -> "Sdn Bhd" (optional kecil, tak buang makna)
+    out = re.sub(r"\bSdn\.\b", "Sdn", out)
+    out = re.sub(r"\bBhd\.\b", "Bhd", out)
     return out
 
 
@@ -2146,6 +2322,7 @@ if gen:
                     "FAIL NO output": "Copy-paste penuh dari No. Rujukan OSC",
                     "Jenis Permohonan output": "Ambil suffix selepas /NNNN- (+ tambah (Serentak) jika serentak)",
                     "Format Mukim/Lot": "Proper Case (Mukim, Lot)",
+                    "Format Pemohon": "Proper Case + Smart Acronym (CEO/KFC/PDC/ABIM...) + elak SDN BHD jadi uppercase",
                 })
 
     except Exception as e:
