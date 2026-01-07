@@ -191,23 +191,18 @@ def is_nan(v) -> bool:
     return v is None or (isinstance(v, float) and math.isnan(v)) or (isinstance(v, str) and v.strip().lower() == "nan")
 
 
+def clean_fail_no(v) -> str:
+    if is_nan(v):
+        return ""
+    s = str(v)
+    s = re.sub(r"[\s\r\n\t]+", "", s)
+    return s.strip()
+
+
 def clean_str(v) -> str:
     if is_nan(v):
         return ""
     return str(v).strip()
-
-
-def clean_fail_no_display(v) -> str:
-    """
-    FAIL NO display: ikut arahan user — copy paste dari Excel.
-    Kita hanya kemaskan whitespace (newline/tab -> space; multi-space -> single space; trim).
-    """
-    if is_nan(v):
-        return ""
-    s = str(v)
-    s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"\s{2,}", " ", s)
-    return s.strip()
 
 
 def is_blankish_text(v) -> bool:
@@ -273,12 +268,6 @@ def in_range(d: Optional[dt.date], start: dt.date, end: dt.date) -> bool:
 
 
 def normalize_osc_prefix(s: str) -> str:
-    """
-    Versi NORMALIZED (untuk parsing/matching):
-    - buang whitespace
-    - standardize prefix kepada MBSP
-    - uppercase
-    """
     if not s:
         return ""
     s2 = str(s).strip()
@@ -313,22 +302,22 @@ def canonical_sheet_name(sheet: str) -> str:
     return s
 
 
-def extract_tail_only(fail_no_norm: str) -> str:
-    s = normalize_osc_prefix(fail_no_norm)
+def extract_tail_only(fail_no: str) -> str:
+    s = normalize_osc_prefix(fail_no)
     m = re.search(r"/(\d{3,5})(?:[-A-Z\(]|$)", s)
     return m.group(1) if m else ""
 
 
-def extract_series_tail_key(fail_no_norm: str) -> str:
-    s = normalize_osc_prefix(fail_no_norm)
+def extract_series_tail_key(fail_no: str) -> str:
+    s = normalize_osc_prefix(fail_no)
     m = re.search(r"^MBSP/\d+/([^/]+)/(\d{3,5})", s)
     if not m:
         return ""
     return f"{m.group(1)}|{m.group(2)}"
 
 
-def extract_osc_head(fail_no_norm: str) -> str:
-    s = normalize_osc_prefix(fail_no_norm)
+def extract_osc_head(fail_no: str) -> str:
+    s = normalize_osc_prefix(fail_no)
     m = re.search(r"^(MBSP)/(\d+)/([^/]+)/(\d{3,5})", s)
     if not m:
         return ""
@@ -356,10 +345,10 @@ def keputusan_is_empty(v) -> bool:
     return False
 
 
-def is_serentak(sheet_name: str, fail_no_display: str) -> bool:
+def is_serentak(sheet_name: str, fail_no: str) -> bool:
     if canonical_sheet_name(sheet_name) == "SERENTAK":
         return True
-    return "SERENTAK" in str(fail_no_display or "").upper()
+    return "SERENTAK" in str(fail_no or "").upper()
 
 
 def _sheet_implied_codes(sheet_u: str) -> Set[str]:
@@ -396,8 +385,8 @@ def _sheet_implied_codes(sheet_u: str) -> Set[str]:
     return out
 
 
-def extract_codes(fail_no_norm: str, sheet_name: str) -> Set[str]:
-    s = normalize_osc_prefix(str(fail_no_norm or ""))
+def extract_codes(fail_no: str, sheet_name: str) -> Set[str]:
+    s = normalize_osc_prefix(str(fail_no or ""))
     tokens = re.split(r"[\s\+\-/\\(),]+", s.upper())
     codes: Set[str] = set()
     for t in tokens:
@@ -413,8 +402,8 @@ def extract_codes(fail_no_norm: str, sheet_name: str) -> Set[str]:
     return codes
 
 
-def split_fail_induk(fail_no_norm: str) -> str:
-    s = normalize_osc_prefix(str(fail_no_norm or "")).strip()
+def split_fail_induk(fail_no: str) -> str:
+    s = normalize_osc_prefix(str(fail_no or "")).strip()
     if not s:
         return s
     for i in range(len(s) - 1, 0, -1):
@@ -440,69 +429,27 @@ def perkara_3lines(d: Optional[dt.date]) -> str:
     return f"Penyediaan Kertas\nMesyuarat Tamat Tempoh\n{dd}"
 
 
-def extract_jenis_perm_from_fail_no_display(fail_no_display: str) -> str:
-    """
-    Ikut arahan user:
-    JENIS PERMOHONAN = teks selepas dash '-' yang berada SELEPAS nombor /NNNN-.
-    Contoh: MBSP/15/U6-2601/0295- BGN PIN.(TG) + PKM PIN.(TG)
-            -> BGN PIN.(TG) + PKM PIN.(TG)
-    """
-    s = clean_fail_no_display(fail_no_display)
-    if not s:
-        return ""
-
-    # Cari pattern "/0295- <jenis>"
-    m = re.search(r"/\s*\d{3,5}\s*-\s*(.+)$", s, flags=re.IGNORECASE)
-    if m:
-        return (m.group(1) or "").strip()
-
-    # Fallback 1: cari "<digits>- <jenis>" di hujung
-    m2 = re.search(r"\b\d{3,5}\s*-\s*(.+)$", s)
-    if m2:
-        return (m2.group(1) or "").strip()
-
-    # Fallback 2: ambil selepas dash terakhir
-    if "-" in s:
-        return s.rsplit("-", 1)[-1].strip()
-
-    return ""
-
-
 # ============================================================
-# DISPLAY FORMAT (Proper Case) — PEMOHON + MUKIM + LOT
-#   - Proper Case
-#   - Akronim kekal HURUF BESAR (contoh: KFC, PDC, JSC)
+# DISPLAY FORMAT (PEMAJU/PEMOHON) — Proper Case for Lampiran G
 # ============================================================
 _ROMAN = {"i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","xiii","xiv","xv","xvi","xvii","xviii","xix","xx"}
 
-# Token korporat yang kita kekalkan sebagai proper (bukan ALL CAPS)
-_CORP_TITLE_TOKENS = {"SDN", "BHD", "BERHAD", "ENTERPRISE", "ENTERPRISES"}
-# Token yang memang patut kekal ALL CAPS walaupun pendek
-_FORCE_UPPER = {"MBSP", "OSC", "JK", "TNB", "TM", "LLP", "PLC", "PLT"}
-
-def format_proper_display(text: str) -> str:
+def format_pemohon_display(name: str) -> str:
     """
-    Proper Case dengan pemulihan akronim.
-    Diguna untuk PEMOHON, MUKIM, LOT output Lampiran G.
+    Convert ALL CAPS (atau apa-apa casing) kepada 'Proper Case' untuk output Lampiran G,
+    dengan pengecualian/penetapan semula token korporat & akronim tertentu.
     """
-    if is_blankish_text(text):
+    if is_blankish_text(name):
         return ""
 
-    original = str(text).strip()
-    original = re.sub(r"[\r\n\t]+", " ", original)
-    original = re.sub(r"\s{2,}", " ", original).strip()
-
-    # Simpan senarai akronim asal: 2-6 huruf semua besar
-    acronyms = set(re.findall(r"\b[A-Z]{2,6}\b", original))
-    # Buang token korporat yang biasanya mahu jadi Proper Case
-    acronyms = {a for a in acronyms if a not in _CORP_TITLE_TOKENS}
-    # Tambah force upper
-    acronyms |= _FORCE_UPPER
+    s = str(name).strip()
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
 
     # Title-case setiap chunk huruf (kekal simbol/pemutus)
-    base = re.sub(r"[A-Za-zÀ-ÿ]+", lambda m: m.group(0).lower().capitalize(), original)
+    base = re.sub(r"[A-Za-zÀ-ÿ]+", lambda m: m.group(0).lower().capitalize(), s)
 
-    # Fix corp tokens
+    # Fix common corp tokens & acronyms
     repl = {
         r"\bSdn\b": "Sdn",
         r"\bBhd\b": "Bhd",
@@ -528,22 +475,13 @@ def format_proper_display(text: str) -> str:
         if w.lower() in _ROMAN:
             return w.upper()
         return w
+
     out = re.sub(r"\b[IVXLCDMivxlcdm]{1,6}\b", _roman_fix, out)
 
-    # Pattern "M&E" / "T&C" -> uppercase letters around &
-    out = re.sub(
-        r"\b([A-Za-z])\s*&\s*([A-Za-z])\b",
-        lambda m: f"{m.group(1).upper()}&{m.group(2).upper()}",
-        out
-    )
+    # Handle patterns like "M&E" / "T&C" -> uppercase letters around &
+    out = re.sub(r"\b([A-Za-z])\s*&\s*([A-Za-z])\b", lambda m: f"{m.group(1).upper()}&{m.group(2).upper()}", out)
 
-    # Restore acronyms: jika output jadi TitleCase (contoh Kfc) -> KFC
-    # Kita replace exact word-boundary case-insensitive.
-    for a in sorted(acronyms, key=len, reverse=True):
-        # contoh a="KFC" -> pattern r"\bKfc\b" / r"\bkfc\b" etc
-        out = re.sub(rf"\b{re.escape(a.lower().capitalize())}\b", a, out)
-        out = re.sub(rf"\b{re.escape(a.lower())}\b", a, out, flags=re.IGNORECASE)
-
+    # Final whitespace normalize
     out = re.sub(r"\s{2,}", " ", out).strip()
     return out
 
@@ -556,44 +494,59 @@ def tindakan_ut(belum_text: str) -> str:
         return ""
     raw = str(belum_text).strip()
 
+    # Split list jabatan (support comma/&//)
     parts = [p.strip() for p in re.split(r"[,&/]+", raw) if p.strip()]
 
+    # Normalizer token: buang space + symbol, dan buang prefix umum
     def _norm_token(x: str) -> str:
         s = (x or "").upper().strip()
+        # buang prefix umum jika orang tulis "JABATAN KEJURUTERAAN" etc
         s = re.sub(r"^(JABATAN|BAHAGIAN|UNIT|SEKSYEN)\s+", "", s)
         s = re.sub(r"\s+", "", s)
         s = re.sub(r"[^A-Z0-9]", "", s)
         return s
 
+    # Mapping utama + alias (FORMAT UPDATE #1)
     internal_map = {
+        # KEJ
         "KEJ": "Pengarah Kejuruteraan",
         "KEJURUTERAAN": "Pengarah Kejuruteraan",
 
+        # PB
         "PB": "Pengarah Perancang Bandar",
         "PERANCANGBANDAR": "Pengarah Perancang Bandar",
 
+        # BGN
         "BGN": "Pengarah Bangunan",
         "BANGUNAN": "Pengarah Bangunan",
 
+        # COB
         "COB": "Pengarah COB",
         "PESURUHJAYABANGUNAN": "Pengarah COB",
 
+        # KES
         "KES": "Pengarah Kesihatan",
         "KESIHATAN": "Pengarah Kesihatan",
 
+        # PEN
         "PEN": "Pengarah Penilaian",
         "PENILAIAN": "Pengarah Penilaian",
 
+        # PBRN
         "PBRN": "Pengarah Perbandaran",
         "PERBANDARAN": "Pengarah Perbandaran",
 
+        # LESEN
         "LESEN": "Pengarah Pelesenan",
         "PELESENAN": "Pengarah Pelesenan",
 
+        # JL
         "JL": "Pengarah Landskap",
         "LANDSKAP": "Pengarah Landskap",
     }
 
+    # Substring alias (lebih tolerant kalau token ada extra perkataan)
+    # Contoh: "JABATAN KEJURUTERAAN" -> KEJURUTERAAN in key
     alias_substrings = [
         ("KEJURUTERAAN", "Pengarah Kejuruteraan"),
         ("PERANCANGBANDAR", "Pengarah Perancang Bandar"),
@@ -1141,6 +1094,7 @@ def _detect_columns_candidates(header_vals: List[object]) -> Dict[str, List[int]
     return cand
 
 
+# --- ROBUST FALLBACK per-row (avoid "Pemaju/Lot kosong" bila duplicate header) ---
 def _is_nonempty(v) -> bool:
     if v is None:
         return False
@@ -1213,6 +1167,7 @@ def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]
 
             cand = _detect_columns_candidates(hdr_vals)
 
+            # sample rows lebih besar supaya cover campur lama+baru
             sample_rows: List[Dict[int, object]] = []
             for rnum, cells in _iter_sheet_rows_cells(z, sheet_path, shared, max_rows_to_scan=None):
                 if rnum <= hdr_rnum:
@@ -1241,10 +1196,10 @@ def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]
                 fail = _pick_from_cols(cells, fail_cols)
                 pem = _pick_from_cols(cells, pem_cols)
 
-                fail_display = clean_fail_no_display(fail)
+                fail_str = clean_fail_no(fail)
                 pem_str = clean_str(pem)
 
-                if (is_nan(fail) or fail_display == "") and (is_nan(pem) or pem_str == ""):
+                if (is_nan(fail) or fail_str == "") and (is_nan(pem) or pem_str == ""):
                     continue
 
                 mukim_val = _pick_from_cols(cells, mukim_cols) if mukim_cols else None
@@ -1259,13 +1214,7 @@ def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]
                 rec = {
                     "daerah": daerah_label,
                     "sheet": sheet_clean,
-
-                    # DISPLAY: ikut Excel (kemas whitespace sahaja)
-                    "fail_no_display": fail_display,
-
-                    # NORMALIZED: untuk parsing/matching sahaja
-                    "fail_no_norm": normalize_osc_prefix(fail_display),
-
+                    "fail_no_raw": normalize_osc_prefix(fail_str),
                     "pemohon": pem_str,
                     "mukim": clean_str(mukim_val) if mukim_val is not None else "",
                     "lot": clean_str(lot_val) if lot_val is not None else "",
@@ -1310,23 +1259,17 @@ def enrich_rows(rows: List[dict]) -> List[dict]:
     for r in rows:
         rr = dict(r)
         rr["sheet_u"] = canonical_sheet_name(r["sheet"])
-
-        # Parsing/matching guna normalized
-        rr["codes"] = extract_codes(rr["fail_no_norm"], rr["sheet_u"])
+        rr["codes"] = extract_codes(r["fail_no_raw"], rr["sheet_u"])
         rr["primary_code"] = parse_primary_code(r.get("jenis_row", ""), rr["sheet_u"])
-        rr["serentak"] = is_serentak(rr["sheet_u"], rr["fail_no_display"])
-        rr["fail_induk"] = split_fail_induk(rr["fail_no_norm"])
+        rr["serentak"] = is_serentak(rr["sheet_u"], r["fail_no_raw"])
+        rr["fail_induk"] = split_fail_induk(r["fail_no_raw"])
 
-        rr["tail"] = extract_tail_only(rr["fail_no_norm"])
-        rr["series_tail"] = extract_series_tail_key(rr["fail_no_norm"])
-        rr["osc_head_norm"] = osc_norm(extract_osc_head(rr["fail_no_norm"]))
+        rr["tail"] = extract_tail_only(r["fail_no_raw"])
+        rr["series_tail"] = extract_series_tail_key(r["fail_no_raw"])
+        rr["osc_head_norm"] = osc_norm(extract_osc_head(r["fail_no_raw"]))
 
         rr["pemohon_key"] = pemohon_norm(r.get("pemohon", ""))
         rr["lot_set"] = lot_tokens(r.get("lot", ""))
-
-        # Jenis permohonan untuk output (rule baru)
-        rr["jenis_from_fail"] = extract_jenis_perm_from_fail_no_display(rr["fail_no_display"])
-
         out.append(rr)
     return out
 
@@ -1374,22 +1317,6 @@ def _agenda_fallback_match(row: dict, agenda: "AgendaIndex") -> bool:
     return False
 
 
-def _choose_serentak_base_row(grp: List[dict]) -> dict:
-    """
-    Untuk rekod serentak (aggregated), FAIL NO & JENIS PERMOHONAN perlu
-    ikut No. Rujukan OSC (full) daripada Excel.
-    Paling selamat: pilih row yang memang sheet SERENTAK jika ada,
-    kalau tiada, ambil row pertama yang serentak.
-    """
-    for g in grp:
-        if g.get("sheet_u") == "SERENTAK":
-            return g
-    for g in grp:
-        if g.get("serentak"):
-            return g
-    return grp[0]
-
-
 def build_categories(
     rows: List[dict],
     agenda: Optional["AgendaIndex"],
@@ -1401,10 +1328,8 @@ def build_categories(
     agenda_enabled: bool,
 ) -> Tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
 
-    # Buang yang dah ada keputusan
     rows = [r for r in rows if keputusan_is_empty(r.get("keputusan"))]
 
-    # Tapisan agenda
     if agenda_enabled and agenda:
         def _keep(r: dict) -> bool:
             if r["sheet_u"] not in AGENDA_FILTER_SHEETS:
@@ -1422,7 +1347,6 @@ def build_categories(
 
         rows = [r for r in rows if _keep(r)]
 
-    # Group by fail_induk (normalized)
     by_induk: Dict[str, List[dict]] = {}
     for r in rows:
         by_induk.setdefault(r["fail_induk"], []).append(r)
@@ -1435,8 +1359,8 @@ def build_categories(
             "cat": cat,
             "tindakan": tindakan,
             "jenis": jenis,
-            "fail_no": fail_no,  # FAIL NO output (display)
-            "pemohon": base_r["pemohon"],
+            "fail_no": fail_no,
+            "pemohon": base_r["pemohon"],  # (display formatting akan dibuat masa output Word)
             "daerah": base_r["daerah"],
             "mukim": base_r["mukim"],
             "lot": base_r["lot"],
@@ -1459,69 +1383,26 @@ def build_categories(
             union_codes |= set(g["codes"])
         km_date = min(km_dates) if km_dates else None
 
-        # Base row untuk output FAIL NO & JENIS PERMOHONAN (rule baru)
-        base_ser = _choose_serentak_base_row(grp) if grp else None
-
-        # FAIL NO output
-        fail_no_ser_display = base_ser["fail_no_display"] if base_ser else ""
-        # Jenis permohonan output
-        jenis_ser_base = (base_ser.get("jenis_from_fail") or "").strip() if base_ser else ""
-        jenis_ser_display = (jenis_ser_base + " (Serentak)").strip() if jenis_ser_base else "(Serentak)"
-
-        # Untuk non-serentak, fail_no_display/jenis_from_fail ikut row masing-masing
+        codes_sorted = canon_serentak_codes(union_codes)
+        codes_join = "+".join(codes_sorted)
+        jenis_ser = (f"{codes_join} (Serentak)".strip() if codes_join else "(Serentak)").strip()
+        fail_no_ser = f"{induk}-{codes_join}" if codes_join else induk
 
         # KATEGORI 1 — KM
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & (PB_CODES - {"PS", "SB", "CT"}):
-                cat1.append(make_rec(
-                    1,
-                    "Pengarah Perancang Bandar",
-                    base_ser,
-                    jenis_ser_display,
-                    fail_no_ser_display,
-                    perkara_3lines(km_date),
-                    "SER-PB"
-                ))
+                cat1.append(make_rec(1, "Pengarah Perancang Bandar", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-PB"))
             if union_codes & {"BGN", "EVCB", "EV", "TELCO"}:
-                cat1.append(make_rec(
-                    1,
-                    "Pengarah Bangunan",
-                    base_ser,
-                    jenis_ser_display,
-                    fail_no_ser_display,
-                    perkara_3lines(km_date),
-                    "SER-BGN"
-                ))
+                cat1.append(make_rec(1, "Pengarah Bangunan", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-BGN"))
 
         if not is_ser:
             for g in grp:
                 if not in_range(g.get("km_date"), km_start, km_end):
                     continue
-
-                fail_no_display = g["fail_no_display"]
-                jenis_base = (g.get("jenis_from_fail") or "").strip()
-                jenis_display = jenis_base if jenis_base else g["sheet_u"]
-
                 if g["codes"] & {"PKM", "TKR", "TKR-GUNA"}:
-                    cat1.append(make_rec(
-                        1,
-                        "Pengarah Perancang Bandar",
-                        g,
-                        jenis_display,
-                        fail_no_display,
-                        perkara_3lines(g.get("km_date")),
-                        "NS-PB"
-                    ))
+                    cat1.append(make_rec(1, "Pengarah Perancang Bandar", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-PB"))
                 if g["codes"] & {"BGN", "EVCB", "EV", "TELCO"}:
-                    cat1.append(make_rec(
-                        1,
-                        "Pengarah Bangunan",
-                        g,
-                        jenis_display,
-                        fail_no_display,
-                        perkara_3lines(g.get("km_date")),
-                        "NS-BGN"
-                    ))
+                    cat1.append(make_rec(1, "Pengarah Bangunan", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-BGN"))
 
         # KATEGORI 2 — UT (row-level filter by primary_code)
         if ut_enabled:
@@ -1554,14 +1435,8 @@ def build_categories(
                     continue
 
                 perkara = f"Ulasan teknikal belum dikemukakan. Tamat Tempoh {g['ut_date'].strftime('%d.%m.%Y')}."
-
-                if is_ser:
-                    jenis = jenis_ser_display
-                    fail_no = fail_no_ser_display
-                else:
-                    fail_no = g["fail_no_display"]
-                    jenis_base = (g.get("jenis_from_fail") or "").strip()
-                    jenis = jenis_base if jenis_base else g["sheet_u"]
+                jenis = jenis_ser if is_ser else g["sheet_u"]
+                fail_no = fail_no_ser if is_ser else g["fail_no_raw"]
 
                 extra_key = f"{g['sheet_u']}|{pc}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
                 cat2.append(make_rec(2, tindakan, g, jenis, fail_no, perkara, extra_key))
@@ -1569,51 +1444,20 @@ def build_categories(
         # KATEGORI 3/4/5 — KM
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & KEJ_CODES:
-                cat3.append(make_rec(
-                    3, "Pengarah Kejuruteraan", base_ser,
-                    jenis_ser_display, fail_no_ser_display,
-                    perkara_3lines(km_date), "SER-KEJ"
-                ))
+                cat3.append(make_rec(3, "Pengarah Kejuruteraan", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-KEJ"))
             if union_codes & JL_CODES:
-                cat4.append(make_rec(
-                    4, "Pengarah Landskap", base_ser,
-                    jenis_ser_display, fail_no_ser_display,
-                    perkara_3lines(km_date), "SER-JL"
-                ))
+                cat4.append(make_rec(4, "Pengarah Landskap", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-JL"))
             if union_codes & {"124A", "204D"}:
-                cat5.append(make_rec(
-                    5, "Pengarah Perancang Bandar", base_ser,
-                    jenis_ser_display, fail_no_ser_display,
-                    perkara_3lines(km_date), "SER-124A204D"
-                ))
+                cat5.append(make_rec(5, "Pengarah Perancang Bandar", grp[0], jenis_ser, fail_no_ser, perkara_3lines(km_date), "SER-124A204D"))
 
         if not is_ser:
             for g in grp:
-                if not in_range(g.get("km_date"), km_start, km_end):
-                    continue
-
-                fail_no_display = g["fail_no_display"]
-                jenis_base = (g.get("jenis_from_fail") or "").strip()
-                jenis_display = jenis_base if jenis_base else g["sheet_u"]
-
-                if g["sheet_u"] in {"KTUP", "JP", "LJUP"}:
-                    cat3.append(make_rec(
-                        3, "Pengarah Kejuruteraan", g,
-                        jenis_display, fail_no_display,
-                        perkara_3lines(g.get("km_date")), f"NS-{g['sheet_u']}"
-                    ))
-                if g["sheet_u"] == "PL":
-                    cat4.append(make_rec(
-                        4, "Pengarah Landskap", g,
-                        jenis_display, fail_no_display,
-                        perkara_3lines(g.get("km_date")), "NS-PL"
-                    ))
-                if g["sheet_u"] in {"PS", "SB", "CT"}:
-                    cat5.append(make_rec(
-                        5, "Pengarah Perancang Bandar", g,
-                        jenis_display, fail_no_display,
-                        perkara_3lines(g.get("km_date")), f"NS-{g['sheet_u']}"
-                    ))
+                if in_range(g.get("km_date"), km_start, km_end) and (g["sheet_u"] in {"KTUP", "JP", "LJUP"}):
+                    cat3.append(make_rec(3, "Pengarah Kejuruteraan", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), f"NS-{g['sheet_u']}"))
+                if in_range(g.get("km_date"), km_start, km_end) and (g["sheet_u"] == "PL"):
+                    cat4.append(make_rec(4, "Pengarah Landskap", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), "NS-PL"))
+                if in_range(g.get("km_date"), km_start, km_end) and (g["sheet_u"] in {"PS", "SB", "CT"}):
+                    cat5.append(make_rec(5, "Pengarah Perancang Bandar", g, g["sheet_u"], g["fail_no_raw"], perkara_3lines(g.get("km_date")), f"NS-{g['sheet_u']}"))
 
     def dedup_list(lst: List[dict]) -> List[dict]:
         seen, out2 = set(), []
@@ -1642,7 +1486,7 @@ def build_categories(
 # ============================================================
 # WORD FORMATTER
 # ============================================================
-COL_WIDTHS_IN = [0.50, 1.75, 1.55, 1.85, 1.55, 0.75, 0.80, 0.85, 1.84]
+COL_WIDTHS_IN = [0.50, 1.75, 1.55, 1.55, 1.45, 0.75, 0.65, 0.70, 1.99]
 HEADERS = ["BIL", "TINDAKAN", "JENIS\nPERMOHONAN", "FAIL NO", "PEMAJU/PEMOHON", "DAERAH", "MUKIM", "LOT", "PERKARA"]
 
 
@@ -1880,13 +1724,13 @@ def fill_table(tbl, recs: List[dict]):
     for rec in recs:
         row = tbl.add_row()
 
+        # FORMAT UPDATE #2: Pemaju/Pemohon sahaja -> Proper Case untuk output Lampiran G
         vals = []
         for k in note_fields:
-            v = str(rec.get(k, "") or "")
-            if k in {"pemohon", "mukim", "lot"}:
-                vals.append(format_proper_display(v))
+            if k == "pemohon":
+                vals.append(format_pemohon_display(str(rec.get(k, ""))))
             else:
-                vals.append(v)
+                vals.append(str(rec.get(k, "")))
 
         for i, val in enumerate(vals):
             cell = row.cells[i]
@@ -2170,11 +2014,9 @@ if gen:
                     "Sheet ditapis agenda": sorted(list(AGENDA_FILTER_SHEETS)),
                     "Rule tapisan agenda": "TAIL-BASED (No Unik Hujung) — PTJ dikecualikan",
                     "Reader Excel": "ULTRA XML + ROBUST FALLBACK (handle duplicate header lama+baru)",
-                    "FAIL NO output": "COPY PASTE penuh dari No. Rujukan OSC",
-                    "JENIS PERMOHONAN output": "Substring selepas '/NNNN-' (+ '(Serentak)' jika serentak)",
-                    "Proper Case output": "PEMAJU/PEMOHON + MUKIM + LOT (akronim kekal uppercase)",
                     "UT filter": "Row-level Jenis Permohonan (PKM/BGN family sahaja; KTUP/204D/124A auto reject)",
                     "Update UT alias": "KEJURUTERAAN/PERANCANG BANDAR/BANGUNAN/... mapped to Pengarah",
+                    "Update Pemaju/Pemohon": "Proper Case untuk output Lampiran G",
                 })
 
     except Exception as e:
