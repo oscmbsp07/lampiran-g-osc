@@ -489,6 +489,22 @@ def extract_jenis_from_fail_no_display(fail_no_display: str) -> str:
 # ============================================================
 _ROMAN = {"i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","xiii","xiv","xv","xvi","xvii","xviii","xix","xx"}
 
+
+# Akronim/initialism/kod yang patut kekal ALL CAPS dalam output Lampiran G
+# Nota: token 1–3 huruf akan kekal ALL CAPS secara automatik dalam formatter;
+# set ini untuk token lebih panjang yang memang rasmi (contoh MBSP, SKMM, dsb).
+_KEEP_ACRONYMS_COMMON = {
+    "ABIM", "CEO", "CFO", "COO", "CTO", "CIO", "CDO",
+    "ISO", "QA", "QC",
+    "MBSP", "OSC",
+    "SPU", "SPS", "SPT",
+    "JKR", "JPS", "JMG", "JAS",
+    "PDC", "PBA", "PBT",
+    "IWK", "SKMM", "TNB", "TM",
+    "KFC", "PDRM", "JPJ",
+    "EVCB", "TELCO",
+    "ENG", "IBS",
+}
 def format_pemohon_display(name: str) -> str:
     """
     Format 'PEMAJU/PEMOHON' untuk output Lampiran G (data mentah biasanya ALL CAPS):
@@ -619,13 +635,29 @@ def format_pemohon_display(name: str) -> str:
             if clean in stopwords_upper:
                 return clean.lower() if not is_first_token else clean.lower().capitalize()
 
-            # Ada digit + huruf -> kekal
+            # Ada digit + huruf:
+            # - Jika gaya kod/teknikal (cth 4G, 5G, A12, PT1234) -> kekal ALL CAPS
+            # - Jika gaya perkataan + nombor hujung (cth MURID2) -> Proper Case (Murid2)
             if any(ch.isdigit() for ch in clean) and any(ch.isalpha() for ch in clean):
-                return clean
+                m_dn = re.fullmatch(r"([A-Z]{4,})([0-9]{1,2})", clean)
+                if m_dn:
+                    return m_dn.group(1).lower().capitalize() + m_dn.group(2)
+                if clean[0].isdigit() or len(clean) <= 3:
+                    return clean
+                return tok.lower().capitalize()
 
-            # Initialism pendek (<=3) -> kekal (cth KB, HHM, PDC)
-            if re.fullmatch(r"[A-Z]{1,3}", clean):
+            # Initialism pendek:
+            # - 1–2 huruf: kekal ALL CAPS (cth U, KB)
+            # - 3 huruf: kekal hanya jika (a) allowlist atau (b) tiada vokal (cth HHM, PDC)
+            if re.fullmatch(r"[A-Z]{1,2}", clean):
                 return clean
+            if re.fullmatch(r"[A-Z]{3}", clean):
+                if clean in _KEEP_ACRONYMS_COMMON:
+                    return clean
+                vowels = sum(1 for ch in clean if ch in "AEIOU")
+                if vowels == 0:
+                    return clean
+                return tok.lower().capitalize()
 
             # Selain itu, anggap perkataan biasa -> Proper Case
             return tok.lower().capitalize()
@@ -709,9 +741,18 @@ def format_mukim_display(s: str) -> str:
         if tok == up and clean in {"DI", "KE", "DAN", "ATAU", "OF", "THE", "AND", "OR", "IN", "ON", "AT", "BY", "TO"}:
             return clean.lower() if not is_first else clean.lower().capitalize()
 
-        # initialism pendek (<=3) kekal
-        if tok == up and re.fullmatch(r"[A-Z]{1,3}", clean):
+        # Initialism pendek:
+        # - 1–2 huruf: kekal ALL CAPS
+        # - 3 huruf: kekal hanya jika (a) allowlist atau (b) tiada vokal
+        if tok == up and re.fullmatch(r"[A-Z]{1,2}", clean):
             return clean
+        if tok == up and re.fullmatch(r"[A-Z]{3}", clean):
+            if clean in _KEEP_ACRONYMS_COMMON:
+                return clean
+            vowels = sum(1 for ch in clean if ch in "AEIOU")
+            if vowels == 0:
+                return clean
+            return tok.lower().capitalize()
 
         return tok.lower().capitalize()
 
