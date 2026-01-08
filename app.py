@@ -510,6 +510,19 @@ def format_pemohon_display(name: str) -> str:
     _STOPWORDS_NOT_ACRONYM = {
         "DI", "KE", "DAN", "ATAU", "DARI", "PADA", "UNTUK", "DALAM", "DENGAN", "ATAS", "BAWAH",
         "OF", "THE", "AND", "OR", "IN", "ON", "AT", "BY", "TO", "FOR", "FROM", "WITH",
+        "SDN",
+        "BHD",
+        "BERHAD",
+        "LTD",
+        "LIMITED",
+        "INC",
+        "CO",
+        "COMPANY",
+        "ENTERPRISE",
+        "ENTERPRISES",
+        "PLC",
+        "LLP",
+        "PLT",
     }
 
     def _should_keep_upper(tok: str) -> bool:
@@ -553,6 +566,25 @@ def format_pemohon_display(name: str) -> str:
 
         up = tok.upper()
 
+        # Corporate suffix/terms (BUKAN akronim) — standardkan casing
+        _corp_map = {
+            "SDN": "Sdn",
+            "BHD": "Bhd",
+            "BERHAD": "Berhad",
+            "LTD": "Ltd",
+            "LIMITED": "Limited",
+            "INC": "Inc",
+            "CO": "Co",
+            "COMPANY": "Company",
+            "ENTERPRISE": "Enterprise",
+            "ENTERPRISES": "Enterprises",
+            "PLC": "PLC",
+            "LLP": "LLP",
+            "PLT": "PLT",
+        }
+        if up in _corp_map:
+            return _corp_map[up]
+
         # Roman numerals
         if up.lower() in _ROMAN:
             return up
@@ -576,6 +608,9 @@ def format_pemohon_display(name: str) -> str:
     # Fix common corp tokens & acronyms (Sdn Bhd kekal betul, BUKAN akronim)
     repl = {
         r"\bSdn\b": "Sdn",
+        r"\bSDN\b": "Sdn",
+        r"\bBHD\b": "Bhd",
+        r"\bBERHAD\b": "Berhad",
         r"\bBhd\b": "Bhd",
         r"\bBerhad\b": "Berhad",
         r"\bEnterprise\b": "Enterprise",
