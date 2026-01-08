@@ -504,9 +504,7 @@ def format_pemohon_display(name: str) -> str:
     if is_blankish_text(name):
         return ""
 
-    raw = str(name).replace("
-", "
-")
+    raw = str(name).replace("\r", "\n")
 
     # Corporate/suffix (bukan akronim)
     corp_token_map = {
@@ -658,10 +656,8 @@ def format_pemohon_display(name: str) -> str:
         t = re.sub(r"[ 	]{2,}", " ", t).strip()
         return t
 
-    lines = [ln for ln in raw.split("
-")]
-    return "
-".join([_format_line(ln) for ln in lines]).strip()
+    lines = [ln for ln in raw.split("\n")]
+    return "\n".join([_format_line(ln) for ln in lines]).strip()
 
 def format_mukim_display(s: str) -> str:
     """
