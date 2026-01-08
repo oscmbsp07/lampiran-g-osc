@@ -46,12 +46,11 @@ ALLOWED_SHEETS = {
     "LJUP",
 }
 
-# Tapisan agenda TERHAD (ikut arahan terbaru user)
-# NOTE: EV termasuk dalam cluster EVCB (kadang kertas maklumat guna "EV" sahaja).
+# Tapisan agenda TERHAD
 AGENDA_FILTER_SHEETS = {
     "SERENTAK",
     "PKM",
-    "TKR-GUNA",        # termasuk variasi "TG" melalui canonical mapping
+    "TKR-GUNA",
     "PKM TUKARGUNA",
     "BGN",
     "TELCO",
@@ -72,7 +71,6 @@ PB_CODES = {"PKM", "TKR-GUNA", "TKR", "124A", "204D", "PS", "SB", "CT"}
 KEJ_CODES = {"KTUP", "LJUP", "JP"}
 JL_CODES = {"PL"}
 
-# UT rules kekal (boleh refine kemudian jika perlu)
 UT_ALLOWED_SHEETS = {"SERENTAK", "PKM", "BGN", "BGN EVCB", "TKR-GUNA", "PKM TUKARGUNA", "TKR"}
 SERENTAK_UT_ALLOWED_INDUK = {"PB", "PKM", "BGN"}
 
@@ -192,7 +190,6 @@ def is_nan(v) -> bool:
 
 
 def clean_fail_no(v) -> str:
-    """Untuk parsing/dedup dalaman: buang whitespace keras."""
     if is_nan(v):
         return ""
     s = str(v)
@@ -269,7 +266,6 @@ def in_range(d: Optional[dt.date], start: dt.date, end: dt.date) -> bool:
 
 
 def normalize_osc_prefix(s: str) -> str:
-    """Untuk parsing dalaman."""
     if not s:
         return ""
     s2 = str(s).strip()
@@ -281,31 +277,21 @@ def normalize_osc_prefix(s: str) -> str:
 
 
 def format_fail_no_display(v) -> str:
-    """
-    Untuk OUTPUT Lampiran G (FAIL NO):
-    - mesti kekal penuh seperti 'No. Rujukan OSC' (termasuk PIN.(TG), (SPEED), dsb)
-    - hanya kemaskan spacing yang jelas mengganggu (tanpa buang kandungan).
-    """
     if is_blankish_text(v):
         return ""
     s = str(v).strip()
 
-    # normalize prefix MBPS/MPSP -> MBSP (tanpa kacau selebihnya)
     s = re.sub(r"^(MBPS|MPSP)", "MBSP", s, flags=re.IGNORECASE)
     s = re.sub(r"^M\.?B\.?S\.?P", "MBSP", s, flags=re.IGNORECASE)
     s = re.sub(r"^M\.?B\.?P\.?S", "MBSP", s, flags=re.IGNORECASE)
 
-    # normalize whitespace
     s = s.replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s).strip()
 
-    # normalize around separators (tidy sahaja)
     s = re.sub(r"\s*/\s*", "/", s)
     s = re.sub(r"\s*-\s*", "-", s)
     s = re.sub(r"\s*\+\s*", " + ", s)
-
-    # buang double space
     s = re.sub(r" {2,}", " ", s).strip()
     return s
 
@@ -435,10 +421,6 @@ def extract_codes(fail_no: str, sheet_name: str) -> Set[str]:
 
 
 def split_fail_induk(fail_no: str) -> str:
-    """
-    Dapatkan induk (tanpa suffix jenis permohonan).
-    Operasi atas versi normalized (tiada whitespace).
-    """
     s = normalize_osc_prefix(str(fail_no or "")).strip()
     if not s:
         return s
@@ -466,13 +448,6 @@ def perkara_3lines(d: Optional[dt.date]) -> str:
 
 
 def extract_jenis_from_fail_no_display(fail_no_display: str) -> str:
-    """
-    RULE UTAMA (ikut arahan user):
-    Jenis Permohonan di Lampiran G = ambil bahagian hujung selepas '/NNNN-' (dash selepas nombor tail).
-    Contoh:
-      MBSP/15/U6-2601/0295-PKM PIN.(TG) + BGN PIN.(TG)
-      -> PKM PIN.(TG) + BGN PIN.(TG)
-    """
     s = format_fail_no_display(fail_no_display)
     if not s:
         return ""
@@ -485,304 +460,358 @@ def extract_jenis_from_fail_no_display(fail_no_display: str) -> str:
 
 
 # ============================================================
-# DISPLAY FORMATTER (Proper Case + smart acronym)
+# DISPLAY FORMATTER (PEMAJU/PEMOHON) — FAIL-SAFE NORMALIZER
 # ============================================================
-_ROMAN = {"i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","xiii","xiv","xv","xvi","xvii","xviii","xix","xx"}
+_ROMAN_RE = re.compile(r"^(?=[MDCLXVI])M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$", re.IGNORECASE)
 
-# Akronim yang memang patut kekal all-caps
-_KEEP_ACRONYMS_COMMON = {
-    "PT", "GM", "HSD", "HDA", "JKR", "JPS", "JMG", "PDC", "PBA", "IWK", "SKMM", "TNB", "TM",
-    "MBSP", "OSC", "KFC", "PDRM", "JPJ", "SPU", "SPS", "SPT",
-    "IOI", "KB", "MPSP", "MBPS",
+# token split PRESERVE 100% whitespace/punctuation
+_CASE_TOKEN_RE = re.compile(
+    r"\s+|[A-Za-zÀ-ÿ]+(?:'[A-Za-zÀ-ÿ]+)?\.?|[0-9]+|[^\w\s]+",
+    re.UNICODE
+)
+
+# function words: if ALL CAPS token matches these, treat as normal words (not acronym)
+_FUNCTION_WORDS = {
+    "DAN", "ATAU", "DI", "KE", "DARI", "UNTUK", "PADA", "OLEH", "DENGAN",
+    "OF", "THE", "TO", "IN", "FOR", "WITH", "BY", "ON", "AT",
 }
 
-# Perkataan biasa yang sering muncul sebagai ALL CAPS dalam KM baharu,
-# tapi BUKAN akronim — jadi kena Proper Case.
-# (Anda boleh tambah jika jumpa kes baru, tapi yang bawah dah cover kes utama anda tunjuk.)
-_PEMOHON_FORCE_TITLE = {
-    "TETUAN": "Tetuan",
-    "TUAN": "Tuan",
-    "PUAN": "Puan",
-    "PERBADANAN": "Perbadanan",
-    "PEMBANGUNAN": "Pembangunan",
-    "PULAU": "Pulau",
-    "PINANG": "Pinang",
-    "MALAYSIA": "Malaysia",
-    "PRASARANA": "Prasarana",
-    "KUALA": "Kuala",
-    "SEBERANG": "Seberang",
-    "PERAI": "Perai",
-    "BANDAR": "Bandar",
-    "RAYA": "Raya",
-    "UTARA": "Utara",
-    "SELATAN": "Selatan",
-    "TIMUR": "Timur",
-    "BARAT": "Barat",
+# lower words in title-case (except first word in line or after ":" label)
+_LOWER_WORDS = {w.lower() for w in ["dan", "atau", "di", "ke", "dari", "untuk", "pada", "oleh", "dengan",
+                                   "of", "the", "to", "in", "for", "with", "by", "on", "at"]}
+
+# honorifics that indicate person-name span
+_HONORIFICS = {
+    "ENCIK", "PN", "PUAN", "CIK", "TUAN", "DATUK", "DATO", "DATO’", "DATO'", "DR", "IR", "TS", "PROF"
 }
 
-# Token korporat/undang-undang yang bukan akronim (jangan jadikan ALL CAPS)
-_CORP_TOKENS = {
-    "SDN": "Sdn",
-    "SDN.": "Sdn.",
-    "BHD": "Bhd",
+# labels that indicate person-name span when followed by ":" or "-"
+# include multiword; we use regex on raw line for reliability
+_LABELS_PATTERN = re.compile(
+    r"(?i)\b("
+    r"NAMA|NAME|NAMA\s+PEMOHON|NAMA\s+PEMILIK|PEMOHON|APPLICANT|"
+    r"PENGARAH|DIRECTOR|JURUTERA|ENGINEER|ARKITEK|ARCHITECT|"
+    r"PERUNDING|CONSULTANT|PEGAWAI|OFFICER|PEMERIKSA|PENYEDIA|"
+    r"DISEMAK\s+OLEH|DISAHKAN\s+OLEH|DISEDIAKAN\s+OLEH"
+    r")\b\s*[:\-]"
+)
+
+# dotted acronym pattern: S.K.M.M.
+_DOTTED_ACRONYM_RE = re.compile(r"^(?:[A-Z]\.){2,}[A-Z]\.?$")
+
+# suffix mapping (only suffix tokens affected; do not force caps on name before suffix)
+# NOTE: we keep PLT and LLP as-is (ALL CAPS)
+_SUFFIX_MAP_SINGLE = {
+    "BHD": "Bhd.",
     "BHD.": "Bhd.",
-    "BERHAD": "Berhad",
-    "ENTERPRISE": "Enterprise",
-    "ENTERPRISES": "Enterprises",
-    "INDUSTRY": "Industry",
-    "INDUSTRIES": "Industries",
-    "HOLDINGS": "Holdings",
-    "HOLDING": "Holding",
-    "TECHNOLOGY": "Technology",
-    "TECHNOLOGIES": "Technologies",
-    "CONSTRUCTION": "Construction",
-    "CONSORTIUM": "Consortium",
-    "DEVELOPMENT": "Development",
-    "MANAGEMENT": "Management",
-    "ELECTRONICS": "Electronics",
-    "TRADING": "Trading",
-    "SERVICES": "Services",
-    "SERVICE": "Service",
-    "SDN BHD": "Sdn Bhd",
+    "LTD": "Ltd.",
+    "LTD.": "Ltd.",
+    "INC": "Inc.",
+    "INC.": "Inc.",
 }
 
-_LOWER_WORDS = {
-    "bin", "binti", "bt", "b", "of", "and", "the", "di", "ke", "dan"
-}
+# special multi-token suffix patterns
+# SDN BHD / SDN. BHD. -> Sdn. Bhd.
+# CO LTD / CO. LTD. -> Co. Ltd.
+def _is_mixed_case_intentional(tok: str) -> bool:
+    # mixed case token like eBantuan, i-Servis should remain unchanged
+    return any(c.islower() for c in tok) and any(c.isupper() for c in tok)
 
-_WORD_RE = re.compile(r"[A-Za-zÀ-ÿ]+|[0-9]+|&|[-/().,]+")
+def _is_all_caps_word(tok: str) -> bool:
+    return tok.isalpha() and tok.upper() == tok and tok.lower() != tok
 
+def _is_word(tok: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-zÀ-ÿ]+(?:'[A-Za-zÀ-ÿ]+)?\.?", tok, re.UNICODE))
 
-def _roman_fix_token(tok: str) -> str:
-    if tok.lower() in _ROMAN:
-        return tok.upper()
-    return tok
+def _strip_trailing_dot(word: str) -> Tuple[str, bool]:
+    if word.endswith(".") and len(word) > 1 and word[:-1].isalpha():
+        return word[:-1], True
+    return word, False
 
+def _title_case_word(word: str) -> str:
+    if not word:
+        return word
+    return word[:1].upper() + word[1:].lower()
 
-def _strip_dots_acronym(up: str) -> str:
-    # S.K.M.M. -> SKMM
-    return re.sub(r"\.", "", up)
-
-
-def _looks_like_acronym(original: str) -> bool:
-    """
-    SMART ACRONYM RULE:
-    - whitelist kekal uppercase
-    - 1-3 huruf uppercase => biasanya akronim (KB, IOI, JKR, dll)
-    - 4 huruf uppercase tanpa vokal => akronim (contoh JMG)
-    - dotted acronym S.K.M.M. => akronim
-    - pattern M&E / T&C => akronim
-    """
-    if not original:
-        return False
-
-    # token mungkin ada titik (S.K.M.M.)
-    if re.fullmatch(r"(?:[A-Za-z]\.){2,}[A-Za-z]\.?", original.strip()):
+def _protected_token(tok: str) -> bool:
+    # Protected tokens (do not change):
+    # - contains digit
+    # - contains URL/email markers
+    # - contains / - _ : # (likely code/ref)
+    # - roman numeral
+    # - dotted acronym
+    # - intentional mixed-case
+    if any(ch.isdigit() for ch in tok):
         return True
-
-    up = original.upper()
-
-    # exclude corp tokens & forced-title words (ini bukan akronim)
-    if up in _CORP_TOKENS or up in _PEMOHON_FORCE_TITLE:
-        return False
-
-    if up in _KEEP_ACRONYMS_COMMON:
+    if "@" in tok or "://" in tok or tok.lower().startswith("http"):
         return True
-
-    # Single letter: biasanya initial (U Mobile)
-    if re.fullmatch(r"[A-Z]", up):
+    if any(ch in tok for ch in ["/", "-", "_", ":", "#"]):
         return True
-
-    # M&E, T&C, A&B
-    if re.fullmatch(r"[A-Z](?:&[A-Z])+", up):
+    if _DOTTED_ACRONYM_RE.fullmatch(tok.strip()):
         return True
-
-    # 2-3 letters all caps => treat acronym
-    if re.fullmatch(r"[A-Z]{2,3}", up):
+    if _is_mixed_case_intentional(tok):
         return True
-
-    # 4 letters: jika tiada vokal, treat acronym
-    if re.fullmatch(r"[A-Z]{4}", up) and not re.search(r"[AEIOU]", up):
+    # roman numeral (pure alpha, length small)
+    base, dot = _strip_trailing_dot(tok)
+    if base.isalpha() and 1 <= len(base) <= 8 and _ROMAN_RE.fullmatch(base):
         return True
-
-    # lebih panjang: biasanya bukan akronim (Skydorm, Qualified, Perbadanan)
+    # initial like "A." keep
+    if re.fullmatch(r"[A-Za-z]\.", tok):
+        return True
     return False
 
+def _looks_like_acronym(tok: str, in_parens: bool) -> bool:
+    # Only for ALL CAPS tokens not protected and not inside person span
+    base, has_dot = _strip_trailing_dot(tok)
+    up = base.upper()
 
-def _proper_word_from_anycase(w: str) -> str:
-    # Proper Case standard untuk satu perkataan (huruf sahaja)
-    if not w:
-        return w
-    return w.lower().capitalize()
+    if in_parens and 2 <= len(up) <= 10 and up.isalpha():
+        return True
 
+    if 2 <= len(up) <= 5 and up.isalpha():
+        # except function words
+        if up in _FUNCTION_WORDS:
+            return False
+        return True
 
-def format_pemohon_display(name: str) -> str:
+    # 6-8 => fail-safe: keep ALL CAPS unless clearly common word
+    if 6 <= len(up) <= 8 and up.isalpha():
+        COMMON_WORDS = {
+            # BM
+            "TETUAN", "MAJLIS", "BANDARAYA", "BANDAR", "PERBADANAN", "PEMBANGUNAN",
+            "SEBERANG", "PERAI", "PULAU", "PINANG", "MALAYSIA",
+            # EN
+            "BUILDING", "BUILDINGS", "DEVELOP", "DEVELOPMENT", "MANAGE", "MANAGEMENT",
+            "CONSORT", "CONSORTIUM", "ENTERPR", "ENTERPRISE", "INDUSTRY", "INDUSTRIES",
+            "TRADING", "SERVICE", "SERVICES", "HOLDING", "HOLDINGS",
+        }
+        if up in COMMON_WORDS:
+            return False  # treat as normal word
+        # Heuristic to catch obvious non-acronym brand-words (e.g. SKYDORM):
+        # if it is pronounceable (has at least 2 vowels including Y) => likely word, not acronym
+        vowels = sum(1 for c in up if c in "AEIOUY")
+        if vowels >= 2:
+            return False
+        return True  # fail-safe
+
+    if len(up) >= 9 and up.isalpha():
+        return False
+
+    return False
+
+def _detect_person_span_ranges(line: str) -> List[Tuple[int, int]]:
     """
-    Convert output PEMAJU/PEMOHON kepada:
-    - Proper Case untuk ayat biasa walaupun sumber ALL CAPS,
-    - Kekal ALL CAPS untuk akronim sebenar,
-    - Kekal betul untuk token korporat: Sdn Bhd, Berhad, LLP, PLC, PLT
-    - Pastikan 'Tetuan' tidak jadi TETUAN.
+    Return list of (start_char, end_char) ranges (half-open) in which
+    ALL CAPS tokens should be treated as person-name words (Proper Case).
     """
-    if is_blankish_text(name):
+    ranges: List[Tuple[int, int]] = []
+    s = line
+
+    # Rule A: after label + ":" or "-"
+    m = _LABELS_PATTERN.search(s)
+    if m:
+        start = m.end()
+        ranges.append((start, len(s)))
+
+    # Rule B: after honorific
+    for hm in re.finditer(r"(?i)\b(ENCIK|PN|PUAN|CIK|TUAN|DATUK|DATO’|DATO'|DATO|DR|IR|TS|PROF)\b", s):
+        ranges.append((hm.start(), len(s)))
+
+    # Rule C: contains BIN/BINTI/A/L/A/P => whole line assumed person name span
+    if re.search(r"(?i)\b(BIN|BINTI|A/L|A/P)\b", s):
+        ranges.append((0, len(s)))
+
+    # Merge overlaps
+    if not ranges:
+        return []
+    ranges.sort()
+    merged = [ranges[0]]
+    for a, b in ranges[1:]:
+        la, lb = merged[-1]
+        if a <= lb:
+            merged[-1] = (la, max(lb, b))
+        else:
+            merged.append((a, b))
+    return merged
+
+def _in_any_range(pos: int, ranges: List[Tuple[int, int]]) -> bool:
+    for a, b in ranges:
+        if a <= pos < b:
+            return True
+    return False
+
+def normalize_case_official_text(text: str) -> str:
+    """
+    BM/EN/MIX case normalizer:
+    - Preserve structure 100% (whitespace, punctuation, line breaks).
+    - Proper Case for non-acronym words.
+    - Keep acronyms/initialism/codes/refs ALL CAPS (fail-safe).
+    - Person-name span override (Proper Case even for short ALL CAPS names).
+    - Apply suffix mapping for company suffixes (Sdn. Bhd., Bhd., Ltd., Inc., Co. Ltd.).
+    """
+    if is_blankish_text(text):
         return ""
 
-    s = str(name).strip()
-    # kekalkan line-break (ada kes pemohon multi-line)
-    s = s.replace("\r", "\n")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    s = str(text)
 
-    lines = s.split("\n")
+    # Preserve original line breaks exactly
+    lines = s.splitlines(keepends=True)
     out_lines: List[str] = []
 
-    for line in lines:
-        line = line.strip()
-        if line == "":
-            out_lines.append("")
-            continue
+    for line_with_endl in lines:
+        # keep line ending as-is
+        if line_with_endl.endswith("\r\n"):
+            line = line_with_endl[:-2]
+            endl = "\r\n"
+        elif line_with_endl.endswith("\n"):
+            line = line_with_endl[:-1]
+            endl = "\n"
+        elif line_with_endl.endswith("\r"):
+            line = line_with_endl[:-1]
+            endl = "\r"
+        else:
+            line = line_with_endl
+            endl = ""
 
-        tokens = _WORD_RE.findall(line)
-        rebuilt: List[str] = []
+        person_ranges = _detect_person_span_ranges(line)
 
-        for tok in tokens:
-            if tok == "":
+        tokens = []
+        for m in _CASE_TOKEN_RE.finditer(line):
+            tokens.append((m.group(0), m.start(), m.end()))
+
+        # First pass: word-level casing + acronym decisions (structure preserved)
+        first_word_in_line = True
+        prev_nonspace = ""
+        new_parts: List[str] = []
+
+        # helper: are we inside parentheses at token start?
+        # We'll track a simple paren depth as we walk.
+        paren_depth = 0
+
+        # Build a quick index for char->paren depth at token boundary (approx)
+        # We'll update depth based on token text.
+        for tok, start, end in tokens:
+            # update in_parens based on depth BEFORE processing token
+            in_parens = paren_depth > 0
+
+            if tok.isspace() or re.fullmatch(r"\s+", tok):
+                new_parts.append(tok)
                 continue
 
-            # punctuation / separators
-            if re.fullmatch(r"[&]", tok):
-                rebuilt.append("&")
-                continue
-            if re.fullmatch(r"[-/().,]+", tok):
-                rebuilt.append(tok)
-                continue
-            if re.fullmatch(r"[0-9]+", tok):
-                rebuilt.append(tok)
-                continue
+            # update parentheses depth AFTER we add token? To decide for next tokens:
+            # but for current token, we use current depth.
+            # We'll update depth at end.
+            is_colon = tok == ":"
 
-            # word token
-            original = tok
-            up = original.upper()
+            if not _is_word(tok) or _protected_token(tok):
+                # Keep token unchanged if not a simple word or protected
+                new_tok = tok
+            else:
+                base, had_dot = _strip_trailing_dot(tok)
+                up = base.upper()
 
-            # Roman numerals
-            if re.fullmatch(r"[IVXLCDMivxlcdm]{1,6}", original):
-                rebuilt.append(_roman_fix_token(original))
-                continue
+                in_person = _in_any_range(start, person_ranges)
 
-            # Lower-case words like bin/binti
-            if original.lower() in _LOWER_WORDS:
-                rebuilt.append(original.lower())
-                continue
+                # Person span override
+                if in_person:
+                    # Special: bin/binti lower; A/L, A/P unchanged handled as protected (because contains '/')
+                    if up == "BIN":
+                        new_tok = "bin" + ("." if had_dot else "")
+                    elif up == "BINTI":
+                        new_tok = "binti" + ("." if had_dot else "")
+                    else:
+                        new_tok = _title_case_word(base) + ("." if had_dot else "")
+                else:
+                    # Suffix mapping (single tokens) — only apply to exact suffix tokens
+                    if up in _SUFFIX_MAP_SINGLE:
+                        new_tok = _SUFFIX_MAP_SINGLE[up]
+                    elif up in {"PLT", "LLP"}:
+                        new_tok = up + ("." if had_dot else "")
+                    else:
+                        # Acronym detection
+                        if _is_all_caps_word(base) and _looks_like_acronym(base, in_parens=in_parens):
+                            new_tok = up + ("." if had_dot else "")
+                        else:
+                            # Proper case / title-case with connector lowering
+                            # if after ":" then do not force lower words
+                            after_label = (prev_nonspace == ":")
+                            w = _title_case_word(base)
 
-            # Force-title (common non-acronym words that appear ALL CAPS)
-            if up in _PEMOHON_FORCE_TITLE:
-                rebuilt.append(_PEMOHON_FORCE_TITLE[up])
-                continue
+                            if (not first_word_in_line) and (not after_label) and (w.lower() in _LOWER_WORDS):
+                                w = w.lower()
+                            new_tok = w + ("." if had_dot else "")
 
-            # Corp tokens
-            if up in _CORP_TOKENS:
-                rebuilt.append(_CORP_TOKENS[up])
-                continue
+            new_parts.append(new_tok)
 
-            # Dotted acronym S.K.M.M.
-            if re.fullmatch(r"(?:[A-Za-z]\.){2,}[A-Za-z]\.?", original.strip()):
-                rebuilt.append(_strip_dots_acronym(up))
-                continue
+            # Update "first_word_in_line" and prev_nonspace
+            if re.search(r"[A-Za-zÀ-ÿ0-9]", tok):
+                # consider word-like as word
+                if _is_word(tok):
+                    first_word_in_line = False
 
-            # Acronym detection (SMART)
-            if _looks_like_acronym(original):
-                rebuilt.append(up)
-                continue
+            if not tok.isspace():
+                prev_nonspace = tok
 
-            # Default: Proper Case
-            rebuilt.append(_proper_word_from_anycase(original))
+            # update paren depth based on raw token text
+            # keep simple: count '(' and ')' in token
+            paren_depth += tok.count("(")
+            paren_depth -= tok.count(")")
+            if paren_depth < 0:
+                paren_depth = 0
 
-        # kemas spacing sekitar simbol & punctuation
-        joined = "".join(
-            [
-                (" " + t) if (i > 0 and not re.fullmatch(r"[-/().,]+", t) and rebuilt[i - 1] not in {"(", "/"} and t not in {")", ".", ",", "/"} and rebuilt[i - 1] not in {"-"} and t not in {"-"} )
-                else t
-                for i, t in enumerate(rebuilt)
-            ]
-        )
-        joined = re.sub(r"\s{2,}", " ", joined).strip()
+        # Second pass: multi-token suffix normalization (SDN BHD, CO LTD)
+        # We must preserve spacing/punctuation, so we operate on token list derived from new_parts,
+        # but since we already preserved structure token-by-token, we can safely adjust only the word tokens.
+        # We'll re-tokenize new_line with same tokenizer and replace patterns by char-span.
+        new_line = "".join(new_parts)
 
-        # Kemas khas: spacing sekitar "/" dan "-"
-        joined = re.sub(r"\s*/\s*", "/", joined)
-        joined = re.sub(r"\s*-\s*", "-", joined)
+        # SDN BHD variants: normalize to "Sdn. Bhd."
+        # This is safe because we only change casing/dots of suffix words.
+        def _fix_sdn_bhd(m: re.Match) -> str:
+            # preserve whitespace between SDN and BHD exactly as in match
+            ws = m.group(2) or " "
+            return "Sdn." + ws + "Bhd."
 
-        # Kemas khas: "&"
-        joined = re.sub(r"\s*&\s*", "&", joined)
+        new_line = re.sub(r"(?i)\bSDN(\.?)\b(\s+)\bBHD(\.?)\b", _fix_sdn_bhd, new_line)
 
-        # Kemas khas: "Sdn Bhd" jika terpecah
-        joined = re.sub(r"\bSdn\.?\s+Bhd\.?\b", "Sdn Bhd", joined, flags=re.IGNORECASE)
+        # CO LTD / CO. LTD. => Co. Ltd.
+        def _fix_co_ltd(m: re.Match) -> str:
+            ws = m.group(2) or " "
+            return "Co." + ws + "Ltd."
 
-        out_lines.append(joined)
+        new_line = re.sub(r"(?i)\bCO(\.?)\b(\s+)\bLTD(\.?)\b", _fix_co_ltd, new_line)
 
-    out = "\n".join(out_lines).strip()
+        out_lines.append(new_line + endl)
 
-    # Normalize beberapa token rasmi
-    out = re.sub(r"\bMbsp\b", "MBSP", out)
-    out = re.sub(r"\bOsc\b", "OSC", out)
+    out = "".join(out_lines)
 
-    # Final trim
-    out = re.sub(r"[ \t]+", " ", out).strip()
-    return out
+    # Keep specific known acronyms in pemohon field even if they became Title Case due to context:
+    # (minimal touch; does not affect spacing/punctuation)
+    # You can add more here if needed.
+    for acro in ["MBSP", "OSC", "JKR", "JPS", "SKMM", "TNB", "TM", "MARA", "IOI", "UEM", "SPU", "SPS", "SPT"]:
+        out = re.sub(rf"\b{acro.title()}\b", acro, out)
 
-
-def _proper_case_line_with_rules(line: str, force_title: Dict[str, str], keep_acronyms: Set[str]) -> str:
-    if is_blankish_text(line):
-        return ""
-
-    # Title-case alphabetic sequences
-    base = re.sub(r"[A-Za-zÀ-ÿ]+", lambda m: m.group(0).lower().capitalize(), line)
-
-    def _word_fix(m: re.Match) -> str:
-        w = m.group(0)
-        up = w.upper()
-        if up in force_title:
-            return force_title[up]
-        if up in keep_acronyms:
-            return up
-        return w
-
-    out = re.sub(r"\b[A-Za-z]{1,12}\b", _word_fix, base)
-    out = re.sub(r"\s{2,}", " ", out).strip()
     return out
 
 
 def format_mukim_display(s: str) -> str:
-    if is_blankish_text(s):
-        return ""
-    lines = str(s).replace("\r", "\n").split("\n")
-    force = {"MUKIM": "Mukim", "SEKSYEN": "Seksyen"}
-    return "\n".join([_proper_case_line_with_rules(ln, force, _KEEP_ACRONYMS_COMMON) for ln in lines]).strip()
+    # Keep previous behavior but preserve structure; mukim typically safe
+    return normalize_case_official_text(s)
 
 
 def format_lot_display(s: str) -> str:
-    if is_blankish_text(s):
-        return ""
-    lines = str(s).replace("\r", "\n").split("\n")
-    force = {"LOT": "Lot", "PLOT": "Plot", "NO": "No", "NO.": "No.", "PT": "PT"}
-    out_lines = []
-    for ln in lines:
-        t = _proper_case_line_with_rules(ln, force, _KEEP_ACRONYMS_COMMON)
-        # Fix "No." variants
-        t = re.sub(r"\bNo\.\b", "No.", t)
-        t = re.sub(r"\bNo\b\s*\.?", "No.", t) if re.search(r"\bNo\b\s*\.", t) else t
-        out_lines.append(t)
-    return "\n".join(out_lines).strip()
+    # Lot contains digits/codes; protected rule keeps them
+    return normalize_case_official_text(s)
 
 
 # ============================================================
-# UT "Belum memberi" mapper — tambah alias (KEJURUTERAAN, PERANCANG BANDAR, dll)
+# UT "Belum memberi" mapper — tambah alias
 # ============================================================
 def tindakan_ut(belum_text: str) -> str:
     if is_blankish_text(belum_text):
         return ""
     raw = str(belum_text).strip()
 
-    # Split list jabatan (support comma/&//)
     parts = [p.strip() for p in re.split(r"[,&/]+", raw) if p.strip()]
 
     def _norm_token(x: str) -> str:
@@ -866,8 +895,8 @@ def tindakan_ut(belum_text: str) -> str:
 
 def pemohon_norm(x: str) -> str:
     s = str(x or "").lower().strip()
-    s = re.sub(r"\b(tetuan|tuan|puan)\b", "", s)
-    s = re.sub(r"\b(sdn\.?\s*bhd\.?|sdn\s*bhd|bhd|berhad|enterprise|enterprises|plc|llp|ltd)\b", "", s)
+    s = re.sub(r"\b(tetuan|tuan|puan|encik|cik|pn|dr|ir|ts|prof)\b", "", s)
+    s = re.sub(r"\b(sdn\.?\s*bhd\.?|sdn\s*bhd|bhd|berhad|enterprise|enterprises|plc|llp|ltd|inc|co\.?)\b", "", s)
     s = re.sub(r"[^a-z0-9]+", "", s)
     return s
 
@@ -1368,7 +1397,6 @@ def _detect_columns_candidates(header_vals: List[object]) -> Dict[str, List[int]
     return cand
 
 
-# --- ROBUST FALLBACK per-row (avoid "Pemaju/Lot kosong" bila duplicate header) ---
 def _is_nonempty(v) -> bool:
     if v is None:
         return False
@@ -1469,7 +1497,6 @@ def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]
                 fail = _pick_from_cols(cells, fail_cols)
                 pem = _pick_from_cols(cells, pem_cols)
 
-                # OUTPUT mesti guna full No. Rujukan OSC (bukan yang dibersihkan)
                 fail_disp = format_fail_no_display(clean_str(fail))
                 fail_raw_for_parse = normalize_osc_prefix(clean_fail_no(fail))
 
@@ -1490,13 +1517,8 @@ def read_kertas_excel_ultra(excel_bytes: bytes, daerah_label: str) -> List[dict]
                 rec = {
                     "daerah": daerah_label,
                     "sheet": sheet_clean,
-
-                    # untuk output
                     "fail_no_disp": fail_disp,
-
-                    # untuk parsing/dedup internal
                     "fail_no_raw": fail_raw_for_parse,
-
                     "pemohon": pem_str,
                     "mukim": clean_str(mukim_val) if mukim_val is not None else "",
                     "lot": clean_str(lot_val) if lot_val is not None else "",
@@ -1543,16 +1565,11 @@ def enrich_rows(rows: List[dict]) -> List[dict]:
         rr["sheet_u"] = canonical_sheet_name(r["sheet"])
         rr["codes"] = extract_codes(r["fail_no_raw"], rr["sheet_u"])
         rr["primary_code"] = parse_primary_code(r.get("jenis_row", ""), rr["sheet_u"])
-
-        # serentak detect guna sheet atau fail_no_disp (lebih tepat ikut arahan)
         rr["serentak"] = is_serentak(rr["sheet_u"], r.get("fail_no_disp", "") or r.get("fail_no_raw", ""))
-
         rr["fail_induk"] = split_fail_induk(r["fail_no_raw"])
-
         rr["tail"] = extract_tail_only(r["fail_no_raw"])
         rr["series_tail"] = extract_series_tail_key(r["fail_no_raw"])
         rr["osc_head_norm"] = osc_norm(extract_osc_head(r["fail_no_raw"]))
-
         rr["pemohon_key"] = pemohon_norm(r.get("pemohon", ""))
         rr["lot_set"] = lot_tokens(r.get("lot", ""))
         out.append(rr)
@@ -1619,7 +1636,6 @@ def build_categories(
         def _keep(r: dict) -> bool:
             if r["sheet_u"] not in AGENDA_FILTER_SHEETS:
                 return True
-
             if r.get("tail") and r["tail"] in agenda.tails_all:
                 return False
             if r.get("series_tail") and r["series_tail"] in agenda.series_tail_all:
@@ -1645,7 +1661,7 @@ def build_categories(
             "tindakan": tindakan,
             "jenis": jenis,
             "fail_no": fail_no,
-            "pemohon": base_r["pemohon"],  # display formatting dibuat masa output Word
+            "pemohon": base_r["pemohon"],
             "daerah": base_r["daerah"],
             "mukim": base_r["mukim"],
             "lot": base_r["lot"],
@@ -1667,7 +1683,6 @@ def build_categories(
             union_codes |= set(g["codes"])
         km_date = min(km_dates) if km_dates else None
 
-        # pilih FAIL NO display terbaik (paling panjang biasanya paling lengkap, termasuk (SPEED), PIN.(TG), dsb)
         fail_no_disp_best = ""
         cand_disp = [g.get("fail_no_disp", "") for g in grp if g.get("fail_no_disp")]
         if cand_disp:
@@ -1675,7 +1690,6 @@ def build_categories(
         else:
             fail_no_disp_best = induk
 
-        # JENIS PERMOHONAN ikut rule user: ambil tail selepas /NNNN-
         jenis_best = extract_jenis_from_fail_no_display(fail_no_disp_best)
         if is_ser:
             if jenis_best:
@@ -1684,7 +1698,6 @@ def build_categories(
             else:
                 jenis_best = "(Serentak)"
 
-        # KATEGORI 1 — KM
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & (PB_CODES - {"PS", "SB", "CT"}):
                 cat1.append(make_rec(1, "Pengarah Perancang Bandar", grp[0], jenis_best, fail_no_disp_best, perkara_3lines(km_date), "SER-PB"))
@@ -1695,16 +1708,13 @@ def build_categories(
             for g in grp:
                 if not in_range(g.get("km_date"), km_start, km_end):
                     continue
-
                 fail_no_disp = g.get("fail_no_disp", "") or g["fail_no_raw"]
                 jenis = extract_jenis_from_fail_no_display(fail_no_disp) or g["sheet_u"]
-
                 if g["codes"] & {"PKM", "TKR", "TKR-GUNA"}:
                     cat1.append(make_rec(1, "Pengarah Perancang Bandar", g, jenis, fail_no_disp, perkara_3lines(g.get("km_date")), "NS-PB"))
                 if g["codes"] & {"BGN", "EVCB", "EV", "TELCO"}:
                     cat1.append(make_rec(1, "Pengarah Bangunan", g, jenis, fail_no_disp, perkara_3lines(g.get("km_date")), "NS-BGN"))
 
-        # KATEGORI 2 — UT (row-level filter by primary_code)
         if ut_enabled:
             for g in grp:
                 if not sheet_is_ut_allowed(g["sheet_u"]):
@@ -1743,7 +1753,6 @@ def build_categories(
                 extra_key = f"{g['sheet_u']}|{pc}|{g['ut_date'].isoformat()}|{(g.get('belum') or '').strip()}"
                 cat2.append(make_rec(2, tindakan, g, jenis, fail_no_disp, perkara, extra_key))
 
-        # KATEGORI 3/4/5 — KM
         if is_ser and in_range(km_date, km_start, km_end):
             if union_codes & KEJ_CODES:
                 cat3.append(make_rec(3, "Pengarah Kejuruteraan", grp[0], jenis_best, fail_no_disp_best, perkara_3lines(km_date), "SER-KEJ"))
@@ -2037,7 +2046,7 @@ def fill_table(tbl, recs: List[dict]):
         vals = []
         for k in note_fields:
             if k == "pemohon":
-                vals.append(format_pemohon_display(str(rec.get(k, ""))))
+                vals.append(normalize_case_official_text(str(rec.get(k, ""))))
             elif k == "mukim":
                 vals.append(format_mukim_display(str(rec.get(k, ""))))
             elif k == "lot":
@@ -2262,7 +2271,6 @@ if gen:
                     except Exception:
                         st.warning("OCR tidak tersedia pada server ini. Sistem teruskan baca agenda tanpa OCR (text sahaja).")
 
-            # --- ULTRA FAST PARALLEL READ (SPU/SPS/SPT) ---
             rows: List[dict] = []
 
             def _read_one_bytes(b: bytes, daerah: str) -> List[dict]:
@@ -2329,8 +2337,7 @@ if gen:
                     "Reader Excel": "ULTRA XML + ROBUST FALLBACK (handle duplicate header lama+baru)",
                     "FAIL NO output": "Copy-paste penuh dari No. Rujukan OSC",
                     "Jenis Permohonan output": "Ambil suffix selepas /NNNN- (+ tambah (Serentak) jika serentak)",
-                    "Format Mukim/Lot": "Proper Case (Mukim, Lot)",
-                    "Format Pemaju/Pemohon": "SMART Proper Case + keep true acronyms + Sdn Bhd correct",
+                    "Format Pemaju/Pemohon": "FAIL-SAFE normalizer (protected tokens + suffix mapping + person-span override)",
                 })
 
     except Exception as e:
