@@ -491,11 +491,11 @@ _ROMAN = {"i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","xiii","
 
 def format_pemohon_display(name: str) -> str:
     """
-    Format 'PEMAJU/PEMOHON' untuk output Lampiran G (data mentah biasanya ALL CAPS):
+    Format 'PEMAJU/PEMOHON' untuk output Lampiran G:
     - Default: Proper Case
-    - Kekalkan akronim/initialism sebagai ALL CAPS (contoh: CEO, KFC, PDC, ABIM, JMG, JAS)
-    - Tetapi singkatan korporat biasa (contoh: Sdn Bhd, Berhad) bukan akronim nama khas, jadi kekal bentuk standard.
-    Nota: fungsi ini fokus pada output Word (display), bukan normalisasi/dedup dalaman.
+    - Kekalkan akronim (contoh: CEO, KFC, PDC, JMG, JAS) sebagai ALL CAPS
+    - Tetapi singkatan korporat biasa (contoh: Sdn Bhd, Berhad) kekal dalam bentuk standard (bukan ALL CAPS)
+    Nota: Fungsi ini sengaja fokus pada kebersihan visual output (Word), bukan normalisasi dedup dalaman.
     """
     if is_blankish_text(name):
         return ""
@@ -538,80 +538,15 @@ def format_pemohon_display(name: str) -> str:
         "LTD": "Ltd",
         "LIMITED": "Limited",
         "CO": "Co",
+        "CO.": "Co.",
         "COMPANY": "Company",
         "INC": "Inc",
+        "INC.": "Inc.",
         "THE": "The",
     }
 
-    # Perkataan biasa yang kerap muncul dalam data nama/alamat tetapi BUKAN akronim
-    # (penting sebab data Kertas Maklumat baru memang banyak ALL CAPS)
-    COMMON_WORDS_NOT_ACRONYM = {
-        # kata hubung / preposisi (BM/EN)
-        "DI", "KE", "DAN", "ATAU", "DARI", "PADA", "UNTUK", "DALAM", "DENGAN", "ATAS", "BAWAH",
-        "OF", "THE", "AND", "OR", "IN", "ON", "AT", "BY", "TO", "FOR", "FROM", "WITH",
-
-        # lokasi/penanda tempat (<=6 huruf paling kerap salah jadi ALL CAPS)
-        "TAMAN", "JALAN", "LORONG", "LEBUH", "KOTA", "DESA", "BANDAR",
-        "BUKIT", "BATU", "SUNGAI", "PULAU", "PINANG",
-        "HULU", "HILIR", "UTARA", "TIMUR", "BARAT", "SELAT", "TENGAH",
-        "TELUK", "AIR", "KUALA", "PANTAI", "DARAT", "TASIK", "TASEK",
-        "KG", "KPG",
-    }
-
-    _VOWELS = set("AEIOU")
-
     # Regex perkataan untuk pemohon (support "M&E", "S/B", "3D", dll)
     word_re = re.compile(r"[A-Za-zÀ-ÿ0-9]+(?:[&/][A-Za-zÀ-ÿ0-9]+)*")
-
-    def _is_acronym_like(clean: str, original_token: str) -> bool:
-        """
-        "Bijak nilai" akronim untuk kes data mentah ALL CAPS:
-        - TRUE hanya bila memang nampak seperti initialism/akronim
-        - FALSE untuk perkataan biasa walaupun ALL CAPS (contoh: TAMAN, JALAN, KOTA, PENANG)
-        """
-        if not clean:
-            return False
-
-        # Allowlist sentiasa menang
-        if clean in _KEEP_ACRONYMS_COMMON:
-            return True
-
-        # Jangan treat corporate suffix / gelaran / common words sebagai akronim
-        if clean in corp_token_map or clean in non_acronym_title_map or clean in COMMON_WORDS_NOT_ACRONYM:
-            return False
-
-        tok = original_token or ""
-        up_tok = tok.upper()
-
-        # Hanya pertimbang sebagai akronim jika asal memang ALL CAPS (data mentah)
-        if tok != up_tok:
-            return False
-
-        # Alphanum (4G, 3D, A1) — kebiasaannya singkatan/format teknikal
-        if any(ch.isdigit() for ch in clean) and any(ch.isalpha() for ch in clean):
-            if re.fullmatch(r"[A-Z0-9]{2,7}", clean):
-                return True
-
-        # Akronim/initialism huruf sahaja
-        if re.fullmatch(r"[A-Z]{2,6}", clean):
-            # 2 huruf: kebanyakan memang initialism, kecuali yang kita dah blacklist (DI, KE, dll)
-            if len(clean) == 2:
-                return True
-
-            v = sum(1 for ch in clean if ch in _VOWELS)
-
-            # Tiada vokal (JMG, JPS, PDC) sangat kuat indikasi akronim
-            if v == 0:
-                return True
-
-            # 1 vokal & pendek: masih kuat indikasi initialism (contoh: KFC ada 0 vokal; "CEO" ada 2 vokal tapi kita allowlist)
-            if v == 1 and len(clean) <= 5:
-                return True
-
-            # Selain itu, treat sebagai perkataan biasa (Proper Case)
-            return False
-
-        return False
 
     def _format_simple_token(tok: str) -> str:
         if not tok:
@@ -636,23 +571,21 @@ def format_pemohon_display(name: str) -> str:
         if clean in non_acronym_title_map:
             return non_acronym_title_map[clean]
 
-        # Akronim allowlist
+        # Akronim allowlist (termasuk yang mungkin datang bukan ALL CAPS)
         if clean in _KEEP_ACRONYMS_COMMON:
             return clean
 
-        # Single letter (M&E): kekal uppercase kalau asal uppercase
-        if len(clean) == 1 and tok == up:
+        # Alphanum ringkas (contoh: 3D, 4G) — kekal uppercase jika asal memang uppercase
+        if re.fullmatch(r"[A-Z0-9]{2,6}", clean) and any(ch.isdigit() for ch in clean) and tok == up:
             return clean
 
-        # Alphanum ringkas (contoh: 3D, 4G) — kekal uppercase jika asal uppercase
-        if re.fullmatch(r"[A-Z0-9]{2,7}", clean) and any(ch.isdigit() for ch in clean) and tok == up:
-            return clean
+        # Heuristik akronim:
+        # - asal ALL CAPS
+        # - 2–5 huruf (elak kata biasa panjang; 6 huruf hanya jika allowlist)
+        if tok == up and re.fullmatch(r"[A-Z]{2,5}", up):
+            return up
 
-        # Heuristik akronim (bijak nilai)
-        if _is_acronym_like(clean, tok):
-            return clean
-
-        # Default Proper Case
+        # Default Proper Case (untuk nama biasa)
         return tok.lower().capitalize()
 
     def _format_token(tok: str) -> str:
@@ -669,6 +602,7 @@ def format_pemohon_display(name: str) -> str:
         return _format_simple_token(tok)
 
     def _format_line(line: str) -> str:
+        # collapse whitespace
         s = re.sub(r"\s{2,}", " ", (line or "")).strip()
 
         # Apply per-token formatting
@@ -678,10 +612,12 @@ def format_pemohon_display(name: str) -> str:
         s2 = re.sub(r"\s*([&/])\s*", r"\1", s2)
 
         # Fix beberapa token sistem yang memang perlu ALL CAPS
+        # (guna boundary supaya tak kacau perkataan lain)
         s2 = re.sub(r"\bMbsp\b", "MBSP", s2)
         s2 = re.sub(r"\bOsc\b", "OSC", s2)
         s2 = re.sub(r"\bJk\b", "JK", s2)
 
+        # Kemaskan space
         s2 = re.sub(r"\s{2,}", " ", s2).strip()
         return s2
 
@@ -699,126 +635,80 @@ _KEEP_ACRONYMS_COMMON = {
     "SPU", "SPS", "SPT",
 }
 
-def _format_generic_line_allcaps_source(
-    line: str,
-    force_title: Dict[str, str],
-    keep_acronyms: Set[str],
-) -> str:
-    """
-    Generic proper-case formatter untuk medan yang data asal ALL CAPS (Mukim/Lot).
-    Kekalkan akronim yang sebenar sahaja.
-    """
+def _proper_case_line_with_rules(line: str, force_title: Dict[str, str], keep_acronyms: Set[str]) -> str:
     if is_blankish_text(line):
         return ""
 
-    COMMON_WORDS_NOT_ACRONYM = {
-        "DI", "KE", "DAN", "ATAU", "DARI", "PADA", "UNTUK", "DALAM", "DENGAN", "ATAS", "BAWAH",
-        "OF", "THE", "AND", "OR", "IN", "ON", "AT", "BY", "TO", "FOR", "FROM", "WITH",
-        "TAMAN", "JALAN", "LORONG", "LEBUH", "KOTA", "DESA", "BANDAR",
-        "BUKIT", "BATU", "SUNGAI", "PULAU", "PINANG",
-        "HULU", "HILIR", "UTARA", "TIMUR", "BARAT", "SELAT", "TENGAH",
-        "TELUK", "AIR", "KUALA", "PANTAI", "DARAT", "TASIK", "TASEK",
-        "KG", "KPG",
-        "LOT", "NO", "PLOT",
-    }
-    _VOWELS = set("AEIOU")
-    word_re = re.compile(r"[A-Za-zÀ-ÿ0-9]+(?:[&/][A-Za-zÀ-ÿ0-9]+)*")
+    # Title-case alphabetic sequences
+    base = re.sub(r"[A-Za-zÀ-ÿ]+", lambda m: m.group(0).lower().capitalize(), line)
 
-    def _is_acronym_like(clean: str, original_token: str) -> bool:
-        if not clean:
-            return False
-        if clean in keep_acronyms:
-            return True
-        if clean in force_title or clean in COMMON_WORDS_NOT_ACRONYM:
-            return False
+    def _word_fix(m: re.Match) -> str:
+        w = m.group(0)
+        up = w.upper()
+        if up in force_title:
+            return force_title[up]
+        if up in keep_acronyms:
+            return up
+        return w
 
-        tok = original_token or ""
-        if tok != tok.upper():
-            return False
-
-        if any(ch.isdigit() for ch in clean) and any(ch.isalpha() for ch in clean):
-            if re.fullmatch(r"[A-Z0-9]{2,7}", clean):
-                return True
-
-        if re.fullmatch(r"[A-Z]{2,6}", clean):
-            if len(clean) == 2 and clean not in COMMON_WORDS_NOT_ACRONYM:
-                return True
-            v = sum(1 for ch in clean if ch in _VOWELS)
-            if v == 0:
-                return True
-            if v == 1 and len(clean) <= 5:
-                return True
-        return False
-
-    def _format_simple(tok: str) -> str:
-        up = tok.upper()
-        clean = re.sub(r"[^A-Z0-9]", "", up)
-
-        if clean.isdigit():
-            return clean
-        if clean.lower() in _ROMAN:
-            return clean.upper()
-
-        # Force title tokens
-        if clean in force_title:
-            return force_title[clean]
-
-        if clean in keep_acronyms:
-            return clean
-
-        if len(clean) == 1 and tok == up:
-            return clean
-
-        if any(ch.isdigit() for ch in clean) and any(ch.isalpha() for ch in clean) and tok == up:
-            return clean
-
-        if _is_acronym_like(clean, tok):
-            return clean
-
-        return tok.lower().capitalize()
-
-    def _format_token(tok: str) -> str:
-        if "&" in tok or "/" in tok:
-            parts = re.split(r"([&/])", tok)
-            out_parts = []
-            for p in parts:
-                if p in {"&", "/"}:
-                    out_parts.append(p)
-                else:
-                    out_parts.append(_format_simple(p))
-            return "".join(out_parts)
-        return _format_simple(tok)
-
-    s = re.sub(r"\s{2,}", " ", (line or "")).strip()
-    s2 = word_re.sub(lambda m: _format_token(m.group(0)), s)
-    s2 = re.sub(r"\s*([&/])\s*", r"\1", s2)
-    s2 = re.sub(r"\s{2,}", " ", s2).strip()
-    return s2
+    out = re.sub(r"\b[A-Za-z]{1,12}\b", _word_fix, base)
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    return out
 
 
 def format_mukim_display(s: str) -> str:
+    """
+    Medan MUKIM (Lampiran G):
+    - Data mentah lazimnya ALL CAPS.
+    - Output perlu Proper Case.
+    - 'MK' dan 'SEK' ialah singkatan biasa untuk Mukim/Seksyen dalam data; ia BUKAN akronim nama khas.
+      Jadi pastikan ia jadi 'Mk' dan 'Sek' (bukan ALL CAPS).
+    - Akronim/initialism sebenar yang jarang muncul (contoh MBSP/OSC) kekal ALL CAPS melalui _KEEP_ACRONYMS_COMMON.
+    """
     if is_blankish_text(s):
         return ""
     lines = str(s).replace("\r", "\n").split("\n")
-    force = {"MUKIM": "Mukim", "SEKSYEN": "Seksyen"}
-    return "\n".join([_format_generic_line_allcaps_source(ln, force, _KEEP_ACRONYMS_COMMON) for ln in lines if ln.strip()]).strip()
+
+    # Force tokens (override) — khusus untuk MUKIM
+    force = {
+        "MUKIM": "Mukim",
+        "SEKSYEN": "Seksyen",
+        "MK": "Mk",
+        "SEK": "Sek",
+    }
+
+    out_lines = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        t = _proper_case_line_with_rules(ln, force, _KEEP_ACRONYMS_COMMON)
+
+        # Guard-rail: kadang data ada bentuk ber-titik seperti "M.K" atau "S.E.K"
+        t = re.sub(r"\bM\s*\.?\s*K\b", "Mk", t, flags=re.IGNORECASE)
+        t = re.sub(r"\bS\s*\.?\s*E\s*\.?\s*K\b", "Sek", t, flags=re.IGNORECASE)
+
+        # kemaskan spacing
+        t = re.sub(r"\s{2,}", " ", t).strip()
+        out_lines.append(t)
+
+    return "\n".join(out_lines).strip()
 
 
 def format_lot_display(s: str) -> str:
     if is_blankish_text(s):
         return ""
     lines = str(s).replace("\r", "\n").split("\n")
-    force = {"LOT": "Lot", "PLOT": "Plot", "NO": "No", "PT": "PT"}
+    force = {"LOT": "Lot", "PLOT": "Plot", "NO": "No", "NO.": "No.", "PT": "PT"}
+    # NOTE: word boundary tidak cover "NO." sebagai satu token bila ada titik; jadi kita handle selepas.
     out_lines = []
     for ln in lines:
-        if not ln.strip():
-            continue
-        t = _format_generic_line_allcaps_source(ln, force, _KEEP_ACRONYMS_COMMON)
-        # kemaskan "No." bila ada titik selepas NO
-        t = re.sub(r"\bNo\s*\.\s*", "No. ", t)
-        t = re.sub(r"\s{2,}", " ", t).strip()
+        t = _proper_case_line_with_rules(ln, force, _KEEP_ACRONYMS_COMMON)
+        # Fix "No." variants
+        t = re.sub(r"\bNo\.\b", "No.", t)
+        t = re.sub(r"\bNo\b\s*\.?", "No.", t) if re.search(r"\bNo\b\s*\.", t) else t
         out_lines.append(t)
     return "\n".join(out_lines).strip()
+
 
 # ============================================================
 # UT "Belum memberi" mapper — tambah alias (KEJURUTERAAN, PERANCANG BANDAR, dll)
