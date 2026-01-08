@@ -491,13 +491,13 @@ _ROMAN = {"i","ii","iii","iv","v","vi","vii","viii","ix","x","xi","xii","xiii","
 
 def format_pemohon_display(name: str) -> str:
     """
-    Convert casing kepada 'Proper Case' untuk output Lampiran G (PEMAJU/PEMOHON),
-    dengan pengecualian token korporat & akronim tertentu.
+    Format untuk kolum PEMAJU/PEMOHON (Lampiran G).
 
-    Prinsip untuk data mentah ALL CAPS:
-    - Default: Proper Case (contoh PULAU -> Pulau, HOTEL -> Hotel).
-    - Kekalkan ALL CAPS hanya bila jelas akronim/initialism/kod (contoh MBSP, PDC, JMG, CEO, KFC, KB).
-    - 'Sdn Bhd' bukan akronim (kekal Sdn Bhd).
+    Data mentah biasanya ALL CAPS. Prinsip:
+    - Default: Proper Case untuk perkataan biasa/nama (PULAU -> Pulau, JIT SIN -> Jit Sin, TAN -> Tan).
+    - Kekalkan ALL CAPS hanya untuk akronim/initialism/kod yang jelas (contoh MBSP, OSC, JMG, PDC, CEO, KFC, IOI, KB).
+    - Suffix syarikat (SDN BHD / BHD / BERHAD / LTD / INC / CO) bukan akronim -> formatkan standard.
+    - Struktur asal (tanda baca & spacing asas) dikekalkan; line break ditukar ke ruang seperti versi asal.
     """
     if is_blankish_text(name):
         return ""
@@ -506,138 +506,106 @@ def format_pemohon_display(name: str) -> str:
     raw = re.sub(r"[\r\n\t]+", " ", raw)
     raw = re.sub(r"\s{2,}", " ", raw).strip()
 
-    # Kata fungsi biasa (bukan akronim) — penting untuk elak 2-3 huruf jadi caps tanpa sebab
-    _STOPWORDS_NOT_ACRONYM = {
-        "DI", "KE", "DAN", "ATAU", "DARI", "PADA", "UNTUK", "DALAM", "DENGAN", "ATAS", "BAWAH",
-        "OF", "THE", "AND", "OR", "IN", "ON", "AT", "BY", "TO", "FOR", "FROM", "WITH",
-        "SDN",
-        "BHD",
-        "BERHAD",
-        "LTD",
-        "LIMITED",
-        "INC",
-        "CO",
-        "COMPANY",
-        "ENTERPRISE",
-        "ENTERPRISES",
-        "PLC",
-        "LLP",
-        "PLT",
+    # Allowlist akronim/initialism (kekal ALL CAPS)
+    keep_acronyms = set(_KEEP_ACRONYMS_COMMON) | {"IOI"}
+
+    # Suffix/entiti korporat (bukan akronim)
+    corp_map = {
+        "SDN": "Sdn",
+        "BHD": "Bhd",
+        "BERHAD": "Berhad",
+        "CO": "Co",
+        "LTD": "Ltd",
+        "INC": "Inc",
+        "PLT": "PLT",   # kekal uppercase
+        "LLP": "LLP",   # kekal uppercase
     }
 
-    def _should_keep_upper(tok: str) -> bool:
-        """
-        Decide sama ada token patut kekal ALL CAPS.
-        Token dianggap calon akronim hanya jika:
-        - asal token ALL CAPS, dan
-        - berada dalam allowlist, atau bentuk initialism yang sangat kuat (consonant-heavy / sangat pendek).
-        """
-        if not tok:
-            return False
-        if tok != tok.upper():
-            return False
+    # Kata fungsi yang sangat kerap (jangan dianggap akronim)
+    func_words = {
+        "DI", "KE", "DAN", "ATAU", "DARI", "PADA", "UNTUK", "DALAM", "DENGAN", "ATAS", "BAWAH",
+        "OF", "THE", "AND", "OR", "IN", "ON", "AT", "BY", "TO", "FOR", "FROM", "WITH",
+    }
 
-        up = tok.upper()
-
-        if up in _STOPWORDS_NOT_ACRONYM:
-            return False
-
-        if up in _KEEP_ACRONYMS_COMMON:
-            return True
-
-        # Kod/rujukan: ada digit + huruf
-        if any(ch.isdigit() for ch in up) and any(ch.isalpha() for ch in up):
-            return True
-
-        # Initialism yang kuat: semua huruf, pendek, "consonant-heavy"
-        if re.fullmatch(r"[A-Z]{2,6}", up):
-            vowels = sum(1 for ch in up if ch in "AEIOU")
-            if vowels == 0:
-                return True
-            if len(up) <= 3 and vowels <= 1:
-                return True
-
-        return False
+    roman_re = re.compile(r"^[IVXLCDM]+$")
 
     def _format_alpha(tok: str) -> str:
-        # Mixed-case sengaja (eBantuan, i-Servis) — jangan kacau
-        if any(ch.islower() for ch in tok) and any(ch.isupper() for ch in tok):
+        if not tok:
+            return tok
+
+        # Jika mixed-case sengaja (cth eBantuan / i-Servis) -> kekal
+        if any(c.islower() for c in tok) and any(c.isupper() for c in tok):
             return tok
 
         up = tok.upper()
 
-        # Corporate suffix/terms (BUKAN akronim) — standardkan casing
-        _corp_map = {
-            "SDN": "Sdn",
-            "BHD": "Bhd",
-            "BERHAD": "Berhad",
-            "LTD": "Ltd",
-            "LIMITED": "Limited",
-            "INC": "Inc",
-            "CO": "Co",
-            "COMPANY": "Company",
-            "ENTERPRISE": "Enterprise",
-            "ENTERPRISES": "Enterprises",
-            "PLC": "PLC",
-            "LLP": "LLP",
-            "PLT": "PLT",
-        }
-        if up in _corp_map:
-            return _corp_map[up]
+        # Korporat suffix mapping (override awal)
+        if up in corp_map:
+            return corp_map[up]
 
-        # Roman numerals
-        if up.lower() in _ROMAN:
+        # Roman numeral
+        if roman_re.fullmatch(up):
             return up
 
-        if _should_keep_upper(tok):
+        # Akronim allowlist
+        if up in keep_acronyms:
             return up
 
+        # Token ALL CAPS: guna heuristik akronim yang ketat (elak "PULAU/HOTEL/MAPLE/MUJUR/GOOI" jadi ALL CAPS)
+        if tok == tok.upper():
+            # kata fungsi -> proper
+            if up in func_words:
+                return tok.lower().capitalize()
+
+            # kod/rujukan (huruf+angka)
+            if any(ch.isdigit() for ch in tok) and any(ch.isalpha() for ch in tok):
+                return up
+
+            # Initialism kuat: pendek dan tiada vokal (KB, PDC, JMG, dll)
+            if re.fullmatch(r"[A-Z]{2,6}", up):
+                vowels = sum(1 for ch in up if ch in "AEIOU")
+                if vowels == 0:
+                    return up
+                # 2-3 huruf yang masih "initialism-like" (contoh: JMG) biasanya dah cover vowels==0;
+                # yang ada vokal (TAN/JIT/SIN/IOI) akan jatuh ke proper-case kecuali allowlist.
+                if len(up) <= 2 and vowels == 0:
+                    return up
+
+        # Default proper case
         return tok.lower().capitalize()
 
-    # Tokenize sambil kekalkan punctuation/spaces (supaya struktur asal tidak berubah secara pelik)
+    # Pecahkan ikut token: huruf / digit / selainnya (tanda baca/space dikekalkan)
     parts = re.findall(r"[A-Za-zÀ-ÿ]+|\d+|[^A-Za-zÀ-ÿ0-9]+", raw)
-    out = []
+    out_parts = []
     for p in parts:
         if re.fullmatch(r"[A-Za-zÀ-ÿ]+", p):
-            out.append(_format_alpha(p))
+            out_parts.append(_format_alpha(p))
         else:
-            out.append(p)
+            out_parts.append(p)
 
-    out = "".join(out)
+    out = "".join(out_parts)
 
-    # Fix common corp tokens & acronyms (Sdn Bhd kekal betul, BUKAN akronim)
-    repl = {
-        r"\bSdn\b": "Sdn",
-        r"\bSDN\b": "Sdn",
-        r"\bBHD\b": "Bhd",
-        r"\bBERHAD\b": "Berhad",
-        r"\bBhd\b": "Bhd",
-        r"\bBerhad\b": "Berhad",
-        r"\bEnterprise\b": "Enterprise",
-        r"\bEnterprises\b": "Enterprises",
-        r"\bLlp\b": "LLP",
-        r"\bPlc\b": "PLC",
-        r"\bPlt\b": "PLT",
-        r"\bMbsp\b": "MBSP",
-        r"\bOsc\b": "OSC",
-        r"\bJk\b": "JK",
-        r"\bTnb\b": "TNB",
-        r"\bTm\b": "TM",
-    }
-    for pat, rep in repl.items():
-        out = re.sub(pat, rep, out)
+    # Standardisasi beberapa pola biasa (sekadar kemas, tak ubah maksud)
+    # Contoh: "Sdn  Bhd" -> "Sdn Bhd"
+    out = re.sub(r"\bSdn\s+Bhd\b", "Sdn Bhd", out)
 
-    # Handle patterns like "M&E" / "T&C" -> uppercase letters around &
-    out = re.sub(r"\b([A-Za-z])\s*&\s*([A-Za-z])\b", lambda m: f"{m.group(1).upper()}&{m.group(2).upper()}", out)
+    # Handle "M&E" / "T&C" => huruf sekitar & jadi uppercase
+    out = re.sub(
+        r"\b([A-Za-z])\s*&\s*([A-Za-z])\b",
+        lambda m: f"{m.group(1).upper()}&{m.group(2).upper()}",
+        out,
+    )
 
     out = re.sub(r"\s{2,}", " ", out).strip()
     return out
 
 
+
+
 _KEEP_ACRONYMS_COMMON = {
     "PT", "GM", "HSD", "HDA", "JKR", "JPS", "JMG", "PDC", "PBA", "IWK", "SKMM", "TNB", "TM",
     "MBSP", "OSC", "KFC", "PDRM", "JPJ", "SPU", "SPS", "SPT", "ABIM", "CEO", "ENG", "IBS",
-    "JAS", "KB", "MARA",
+    "JAS", "KB", "MARA",    "IOI",
 }
 
 def _proper_case_line_with_rules(line: str, force_title: Dict[str, str], keep_acronyms: Set[str]) -> str:
